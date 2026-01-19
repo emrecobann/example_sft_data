@@ -1196,16 +1196,17 @@
     namespace DCPS {
 
     class OpenDDS_Dcps_Export DataReaderImpl
-      : public virtual LocalObject<DDS::DataReader>
-      , public virtual DataReaderCallbacks
-      , public virtual EntityImpl
-      , public virtual TransportClient
-      , public virtual TransportReceiveListener
+      : public virtual LocalObject<DataReaderEx>,
+        public virtual DataReaderCallbacks,
+        public virtual EntityImpl,
+        public virtual TransportClient,
+        public virtual TransportReceiveListener,
+        private WriterInfoListener
     {
     ```
 
     **Key inheritance:**
-    - `LocalObject<DDS::DataReader>` - Implements DDS::DataReader interface
+    - `LocalObject<DataReaderEx>` - Implements DataReaderEx interface (extends DDS::DataReader)
     - `DataReaderCallbacks` - Internal callback interface for associations
     - `EntityImpl` - Base entity functionality (enable, QoS, listener)
     - `TransportClient` - Transport layer integration
