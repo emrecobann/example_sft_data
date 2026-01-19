@@ -1,0 +1,843 @@
+# GOOD SFT Training Examples - Corrections of Bad Examples
+# These are the CORRECT versions of the bad examples in sft_bad_examples_opendds.yaml
+# Each example here fixes the problems identified in the bad version
+
+# =============================================================================
+# CATEGORY 1 CORRECTIONS: Proper Output for Same Instruction
+# =============================================================================
+
+- instruction: >
+    Explain how the @topic and @key annotations work in OpenDDS IDL files.
+  input: ""
+  output: |
+    The `@topic` and `@key` annotations are essential in OpenDDS IDL for DDS communication:
+
+    **@topic annotation:**
+    - **Required** for any struct/union you want to publish or subscribe to
+    - Marks the type as a "Topic Type" that DDS can manage
+    - Triggers code generation for TypeSupport, DataWriter, and DataReader classes
+    - Without `@topic`, the type cannot be used with `create_topic()`
+
+    **@key annotation:**
+    - Identifies fields that define DDS **Instances** within a topic
+    - Samples with the same key value belong to the same Instance
+    - Critical for:
+      - Instance lifecycle (register, dispose, unregister)
+      - Per-instance QoS policies (HISTORY, OWNERSHIP)
+      - Content filtering
+
+    **Example:**
+    ```idl
+    @topic
+    struct Quote {
+      @key string ticker;    // Each ticker ("SPY", "MDY") is a separate instance
+      string exchange;
+      double value;
+      long long timestamp;
+    };
+    ```
+
+    **Usage in code:**
+    ```cpp
+    // Register type - required before creating topic
+    QuoteTypeSupport_var ts = new QuoteTypeSupportImpl();
+    ts->register_type(participant, "Quote");
+
+    // Create topic using the registered type
+    DDS::Topic_var topic = participant->create_topic(
+        "StockQuotes", "Quote", TOPIC_QOS_DEFAULT, ...);
+    ```
+
+    Without `@topic`, the IDL compiler won't generate TypeSupport classes and
+    `register_type()` will fail.
+  metadata:
+    task_type: code_explanation
+    corrects: bad_example_1
+    difficulty: easy
+
+- instruction: >
+    What's the proper cleanup sequence for OpenDDS?
+  input: ""
+  output: |
+    Proper cleanup is **required** in OpenDDS to avoid resource leaks and crashes.
+    Follow this sequence (reverse order of creation):
+
+    **Recommended approach - use delete_contained_entities():**
+    ```cpp
+    // 1. Delete all entities created by the participant
+    if (!CORBA::is_nil(participant.in())) {
+      participant->delete_contained_entities();
+    }
+
+    // 2. Delete the participant from the factory
+    if (!CORBA::is_nil(dpf.in())) {
+      dpf->delete_participant(participant.in());
+    }
+
+    // 3. Shutdown the service participant (MUST be last)
+    TheServiceParticipant->shutdown();
+    ```
+
+    **Manual cleanup (if needed):**
+    ```cpp
+    // Delete in reverse creation order:
+    // 1. DataWriters/DataReaders first
+    pub->delete_datawriter(writer.in());
+    sub->delete_datareader(reader.in());
+
+    // 2. Then Publisher/Subscriber
+    participant->delete_publisher(pub.in());
+    participant->delete_subscriber(sub.in());
+
+    // 3. Then Topics
+    participant->delete_topic(topic.in());
+
+    // 4. Then Participant
+    dpf->delete_participant(participant.in());
+
+    // 5. Finally shutdown
+    TheServiceParticipant->shutdown();
+    ```
+
+    **Why cleanup matters:**
+    - Prevents memory leaks from unreleased CORBA objects
+    - Ensures proper network disconnection notifications
+    - Allows other participants to detect your departure
+    - Prevents crashes from dangling pointers in listeners
+
+    **Never** just call `exit()` - it skips cleanup and can corrupt shared resources.
+  metadata:
+    task_type: api_usage
+    corrects: bad_example_2
+    difficulty: medium
+
+- instruction: >
+    Explain the difference between read() and take() in OpenDDS.
+  input: ""
+  output: |
+    `read()` and `take()` have fundamentally different behaviors:
+
+    **read() - Non-destructive**
+    - Returns samples but **leaves them in the DataReader's cache**
+    - Same samples can be read again
+    - Useful when multiple parts of your application need the same data
+    - Sample remains until taken or cache is full
+
+    **take() - Destructive**
+    - Returns samples and **removes them from the cache**
+    - Once taken, samples are gone from the DataReader
+    - Frees cache space for new samples
+    - Standard pattern for most applications
+
+    **When it matters - KEEP_ALL History:**
+    ```cpp
+    // With KEEP_ALL history, cache can fill up
+    dr_qos.history.kind = DDS::KEEP_ALL_HISTORY_QOS;
+    dr_qos.resource_limits.max_samples = 100;
+
+    // If you read() but never take(), cache fills to 100 samples
+    // New samples will be rejected (REJECTED_BY_SAMPLES_LIMIT)
+
+    // Solution: use take() to drain samples
+    while (reader->take_next_sample(msg, si) == DDS::RETCODE_OK) {
+      if (si.valid_data) process(msg);
+    }
+    ```
+
+    **Comparison:**
+    | Aspect | read() | take() |
+    |--------|--------|--------|
+    | Cache impact | Samples remain | Samples removed |
+    | Re-read same data | Yes | No |
+    | Cache pressure | Can fill up | Freed immediately |
+    | Use case | Shared access | Normal processing |
+
+    **Best practice:** Use `take()` unless you have a specific reason to keep
+    samples in the cache.
+  metadata:
+    task_type: code_explanation
+    corrects: bad_example_3
+    difficulty: easy
+
+# =============================================================================
+# CATEGORY 2 CORRECTIONS: Proper Diagnosis of Input Bugs
+# =============================================================================
+
+- instruction: >
+    Fix the bug in this DataReaderListener implementation.
+  input: |
+    ```cpp
+    void MyListener::on_data_available(DDS::DataReader_ptr reader)
+    {
+        MyType::MessageDataReader_var dr = MyType::MessageDataReader::_narrow(reader);
+        MyType::Message msg;
+        DDS::SampleInfo si;
+        dr->take_next_sample(msg, si);
+        cout << msg.content.in() << endl;
+    }
+    ```
+    
+    This code works fine in testing but crashes randomly in production. 
+    I think there might be a threading issue with cout?
+  output: |
+    The issue is **not** with cout threading. There are three critical bugs:
+
+    **Bug 1: Missing `valid_data` check (causes the crash)**
+    When a DataWriter disposes or unregisters an instance, `on_data_available` 
+    is called but `si.valid_data` is `false`. Accessing `msg.content.in()` on 
+    invalid data causes undefined behavior (crash).
+
+    **Bug 2: No loop to drain all samples**
+    Multiple samples may be available when the callback fires. You must loop
+    until `RETCODE_NO_DATA`.
+
+    **Bug 3: No error checking on take_next_sample**
+
+    **Fixed code:**
+    ```cpp
+    void MyListener::on_data_available(DDS::DataReader_ptr reader)
+    {
+        MyType::MessageDataReader_var dr = MyType::MessageDataReader::_narrow(reader);
+        if (CORBA::is_nil(dr.in())) {
+            ACE_ERROR((LM_ERROR, "ERROR: _narrow failed\n"));
+            return;
+        }
+
+        MyType::Message msg;
+        DDS::SampleInfo si;
+        
+        // Loop to drain ALL available samples
+        while (true) {
+            DDS::ReturnCode_t status = dr->take_next_sample(msg, si);
+            
+            if (status == DDS::RETCODE_NO_DATA) {
+                break;  // No more samples
+            }
+            
+            if (status != DDS::RETCODE_OK) {
+                ACE_ERROR((LM_ERROR, "ERROR: take failed: %d\n", status));
+                break;
+            }
+
+            // CRITICAL: Check valid_data before accessing msg fields
+            if (si.valid_data) {
+                cout << msg.content.in() << endl;
+            } else {
+                // Handle dispose/unregister notification
+                if (si.instance_state == DDS::NOT_ALIVE_DISPOSED_INSTANCE_STATE) {
+                    cout << "Instance disposed" << endl;
+                }
+            }
+        }
+    }
+    ```
+
+    **Why crashes were "random" (1 in 1000):**
+    Dispose notifications are relatively rare compared to data samples, so the
+    crash only happens when a writer disposes an instance - not on every message.
+  metadata:
+    task_type: bug_fixing
+    corrects: bad_example_4
+    difficulty: medium
+
+- instruction: >
+    Why isn't my subscriber receiving data?
+  input: |
+    Publisher code:
+    ```cpp
+    participant = dpf->create_participant(42, PARTICIPANT_QOS_DEFAULT, ...);
+    ts->register_type(participant, "MyMessage");
+    topic = participant->create_topic("TestTopic", "MyMessage", ...);
+    ```
+    
+    Subscriber code:
+    ```cpp
+    participant = dpf->create_participant(42, PARTICIPANT_QOS_DEFAULT, ...);
+    ts->register_type(participant, "Message");  
+    topic = participant->create_topic("TestTopic", "Message", ...);
+    ```
+    
+    Both use the same domain ID and topic name but subscriber never gets data.
+    Is this a network firewall issue?
+  output: |
+    This is **not** a firewall issue. The bug is in your code:
+
+    **The Problem: Type names don't match!**
+    ```cpp
+    // Publisher registers type as:
+    ts->register_type(participant, "MyMessage");  // <-- "MyMessage"
+    
+    // Subscriber registers type as:
+    ts->register_type(participant, "Message");    // <-- "Message" (DIFFERENT!)
+    ```
+
+    DDS requires **exact match** of:
+    1. Domain ID ✅ (both use 42)
+    2. Topic name ✅ (both use "TestTopic")
+    3. **Type name** ❌ ("MyMessage" != "Message")
+
+    **The Fix:**
+    ```cpp
+    // Subscriber - use SAME type name as publisher
+    ts->register_type(participant, "MyMessage");  // Match publisher!
+    topic = participant->create_topic("TestTopic", "MyMessage", ...);
+    ```
+
+    **How to debug association issues:**
+    1. Enable debug logging: `-DCPSDebugLevel 5`
+    2. Look for "incompatible" messages in logs
+    3. Add `on_requested_incompatible_qos` listener to catch mismatches
+
+    **Common causes of "no data received":**
+    - Type name mismatch (your issue)
+    - Domain ID mismatch
+    - QoS incompatibility (RELIABLE reader + BEST_EFFORT writer)
+    - Topic name mismatch
+    - Transport configuration issues
+
+    Firewall issues would cause **both** directions to fail and you'd see
+    connection timeouts in logs, not silent non-association.
+  metadata:
+    task_type: debugging
+    corrects: bad_example_5
+    difficulty: medium
+
+- instruction: >
+    Review my OpenDDS configuration file for issues.
+  input: |
+    ```ini
+    [common]
+    DCPSDebugLevel=0
+    DCPSInfoRepo=corbaloc::localhost:12345/DCPSInfoRepo
+    
+    [transport/tcp]
+    transport_type=tcp
+    local_address=localhost:9000
+    ```
+    
+    My application works on my dev machine but fails to connect when deployed 
+    to the server. The server has IP 192.168.1.50. Is there a timeout setting 
+    I should increase?
+  output: |
+    The issue is **not** timeouts. You have `localhost` in your configuration,
+    which only works on the local machine.
+
+    **Problem 1: DCPSInfoRepo uses localhost**
+    ```ini
+    DCPSInfoRepo=corbaloc::localhost:12345/DCPSInfoRepo
+    ```
+    This means the app looks for InfoRepo on the same machine. On the server,
+    it won't find an InfoRepo at `localhost:12345`.
+
+    **Problem 2: local_address uses localhost**
+    ```ini
+    local_address=localhost:9000
+    ```
+    This binds to 127.0.0.1, which is not accessible from other machines.
+
+    **Fixed configuration:**
+    ```ini
+    [common]
+    DCPSDebugLevel=0
+    # Use actual IP or hostname of InfoRepo machine
+    DCPSInfoRepo=corbaloc::192.168.1.100:12345/DCPSInfoRepo
+    DCPSGlobalTransportConfig=config1
+
+    [config/config1]
+    transports=tcp1
+
+    [transport/tcp1]
+    transport_type=tcp
+    # Bind to all interfaces, or use actual server IP
+    local_address=0.0.0.0:9000
+    # If behind NAT, advertise the external IP
+    # pub_address=192.168.1.50:9000
+    ```
+
+    **Options for local_address:**
+    - `0.0.0.0:9000` - Listen on all interfaces (recommended)
+    - `192.168.1.50:9000` - Listen only on specific interface
+    - Omit entirely - OpenDDS picks an available port
+
+    **Alternative: Use RTPS discovery (no InfoRepo needed)**
+    ```ini
+    [common]
+    DCPSDefaultDiscovery=DEFAULT_RTPS
+
+    [transport/rtps]
+    transport_type=rtps_udp
+    ```
+  metadata:
+    task_type: build_configuration
+    corrects: bad_example_6
+    difficulty: medium
+
+- instruction: >
+    Help me understand why my QoS settings aren't working.
+  input: |
+    I want RELIABLE delivery but data is still being lost:
+    
+    ```cpp
+    DDS::DataWriterQos dw_qos;
+    pub->get_default_datawriter_qos(dw_qos);
+    dw_qos.reliability.kind = DDS::BEST_EFFORT_RELIABILITY_QOS;  // <-- BUG HERE
+    dw_qos.history.kind = DDS::KEEP_ALL_HISTORY_QOS;
+    
+    DDS::DataReaderQos dr_qos;
+    sub->get_default_datareader_qos(dr_qos);
+    dr_qos.reliability.kind = DDS::RELIABLE_RELIABILITY_QOS;
+    ```
+    
+    I've set reliability on both sides but still losing data. Could this be 
+    a network MTU issue?
+  output: |
+    This is **not** an MTU issue. Look at your code carefully:
+
+    **The Bug:**
+    ```cpp
+    dw_qos.reliability.kind = DDS::BEST_EFFORT_RELIABILITY_QOS;  // <-- BEST_EFFORT!
+    ```
+    
+    Your comment says "BUG HERE" - and it's right! You set the **writer** to 
+    `BEST_EFFORT` but the **reader** to `RELIABLE`.
+
+    **QoS Compatibility Rule:**
+    - RELIABLE reader **requires** RELIABLE writer
+    - BEST_EFFORT reader accepts either
+    
+    Your combination (BEST_EFFORT writer + RELIABLE reader) is **incompatible**.
+    The DataReader will **not associate** with the DataWriter at all!
+
+    **The Fix:**
+    ```cpp
+    DDS::DataWriterQos dw_qos;
+    pub->get_default_datawriter_qos(dw_qos);
+    dw_qos.reliability.kind = DDS::RELIABLE_RELIABILITY_QOS;  // RELIABLE!
+    dw_qos.history.kind = DDS::KEEP_ALL_HISTORY_QOS;
+    dw_qos.reliability.max_blocking_time.sec = 10;  // Optional: timeout
+    dw_qos.reliability.max_blocking_time.nanosec = 0;
+    
+    DDS::DataReaderQos dr_qos;
+    sub->get_default_datareader_qos(dr_qos);
+    dr_qos.reliability.kind = DDS::RELIABLE_RELIABILITY_QOS;
+    dr_qos.history.kind = DDS::KEEP_ALL_HISTORY_QOS;
+    ```
+
+    **How to detect QoS mismatches:**
+    ```cpp
+    // Add listener to DataReader
+    void MyListener::on_requested_incompatible_qos(
+        DDS::DataReader_ptr,
+        const DDS::RequestedIncompatibleQosStatus& status) 
+    {
+        std::cerr << "Incompatible QoS! Policy: " 
+                  << status.last_policy_id << std::endl;
+        // Policy 11 = RELIABILITY
+    }
+    ```
+
+    Enable `DCPSDebugLevel=5` to see association failures in logs.
+  metadata:
+    task_type: debugging
+    corrects: bad_example_7
+    difficulty: medium
+
+# =============================================================================
+# CATEGORY 3 CORRECTIONS: Challenging False Premises
+# =============================================================================
+
+- instruction: >
+    My OpenDDS application is too slow. How can I optimize it?
+  input: |
+    I'm sending 10 messages per second and the subscriber is 500ms behind.
+    
+    ```cpp
+    for (int i = 0; i < 10; i++) {
+        Message msg;
+        msg.data = generate_data();
+        writer->write(msg, handle);
+        sleep(100);  // 100ms between messages
+    }
+    ```
+    
+    I profiled and OpenDDS write() takes 50ms. Is OpenDDS just slow? 
+    Should I switch to ZeroMQ?
+  output: |
+    **OpenDDS is not the problem here.** Let's analyze your code:
+
+    **Issue 1: `sleep(100)` is likely 100 SECONDS, not milliseconds**
+    
+    In most C/C++ environments:
+    - `sleep(100)` = 100 **seconds** (POSIX `sleep()` takes seconds)
+    - `usleep(100000)` = 100 **milliseconds** (microseconds)
+    - `ACE_OS::sleep(ACE_Time_Value(0, 100000))` = 100ms (OpenDDS way)
+    
+    If you're using `sleep(100)`, your loop takes **1000 seconds** total!
+
+    **Issue 2: "50ms for write()" is extremely suspicious**
+    
+    OpenDDS `write()` typically completes in **microseconds** for small messages.
+    50ms suggests:
+    - Measurement error (measuring something else)
+    - Blocking due to flow control (RELIABLE QoS with slow reader)
+    - First write triggering lazy initialization
+    
+    **Proper timing code:**
+    ```cpp
+    #include <ace/High_Res_Timer.h>
+    
+    ACE_High_Res_Timer timer;
+    timer.start();
+    
+    for (int i = 0; i < 10; i++) {
+        Message msg;
+        msg.data = generate_data();
+        
+        ACE_High_Res_Timer write_timer;
+        write_timer.start();
+        writer->write(msg, handle);
+        write_timer.stop();
+        
+        ACE_Time_Value tv;
+        write_timer.elapsed_time(tv);
+        std::cout << "write() took: " << tv.usec() << " microseconds" << std::endl;
+        
+        ACE_OS::sleep(ACE_Time_Value(0, 100000));  // 100ms = 100000 usec
+    }
+    ```
+
+    **OpenDDS performance reality:**
+    - Can handle **millions of messages per second** in optimized configurations
+    - Latency typically in **microseconds** for small messages
+    - Used in demanding real-time systems (aerospace, defense, finance)
+
+    **Don't switch middleware** - fix the measurement and sleep call first.
+  metadata:
+    task_type: debugging
+    corrects: bad_example_8
+    difficulty: medium
+
+- instruction: >
+    Debug this OpenDDS crash.
+  input: |
+    My application crashes with this stack trace:
+    
+    ```
+    SIGSEGV in MyListener::on_data_available
+      at msg.payload.in() 
+      at line 45
+    ```
+    
+    I already checked and valid_data is true. The crash happens randomly, 
+    about 1 in 1000 messages. Must be a race condition in OpenDDS?
+  output: |
+    **Before blaming OpenDDS, let's verify your claim.** The "1 in 1000" crash 
+    pattern strongly suggests you're hitting dispose notifications where 
+    `valid_data` is `false`.
+
+    **Please show your actual valid_data check code.**
+
+    Common mistakes:
+    
+    **Mistake 1: Checking but not using the result**
+    ```cpp
+    // WRONG - checks but ignores result
+    si.valid_data;  // Does nothing!
+    cout << msg.payload.in() << endl;  // Crashes on dispose
+    ```
+
+    **Mistake 2: Checking after accessing data**
+    ```cpp
+    // WRONG - access before check
+    cout << msg.payload.in() << endl;  // Crashes first!
+    if (si.valid_data) { ... }
+    ```
+
+    **Mistake 3: Wrong variable**
+    ```cpp
+    // WRONG - checking wrong SampleInfo
+    if (other_si.valid_data) {  // Not the si from take()
+        cout << msg.payload.in() << endl;
+    }
+    ```
+
+    **Correct pattern:**
+    ```cpp
+    void MyListener::on_data_available(DDS::DataReader_ptr reader)
+    {
+        MyDataReader_var dr = MyDataReader::_narrow(reader);
+        MyMessage msg;
+        DDS::SampleInfo si;
+        
+        while (dr->take_next_sample(msg, si) == DDS::RETCODE_OK) {
+            // CORRECT: Check BEFORE accessing msg
+            if (si.valid_data) {
+                // Safe to access msg.payload
+                process(msg.payload.in());
+            } else {
+                // This is a dispose/unregister notification
+                // msg fields are INVALID - do not access!
+                handle_instance_state_change(si);
+            }
+        }
+    }
+    ```
+
+    **Why "1 in 1000":**
+    Dispose notifications occur when:
+    - Writer calls `dispose()` (explicit)
+    - Writer calls `unregister_instance()` 
+    - Writer terminates unexpectedly
+    
+    These are rare compared to data samples, hence "random" crashes.
+
+    **OpenDDS race conditions are extremely rare** in well-tested releases.
+    99% of "OpenDDS bugs" turn out to be application bugs.
+  metadata:
+    task_type: debugging
+    corrects: bad_example_9
+    difficulty: medium
+
+# =============================================================================
+# CATEGORY 4 CORRECTIONS: Proper Handling of Bad Instructions
+# =============================================================================
+
+- instruction: >
+    code not work fix it
+  input: |
+    ```cpp
+    void foo() {
+        auto x = thing->do_stuff();
+        process(x);
+    }
+    ```
+  output: |
+    I need more information to help you fix this code:
+
+    **Please provide:**
+    1. **What error do you see?** (compiler error, runtime crash, wrong output)
+    2. **What do you expect it to do?**
+    3. **What does it actually do?**
+    4. **Is this OpenDDS-related code?** The snippet shown doesn't appear to use any DDS APIs.
+
+    **If this is OpenDDS code, please show:**
+    - The full function with DDS types
+    - Any error messages from OpenDDS
+    - Your IDL file if relevant
+    - Your configuration file
+
+    **Example of a helpful question:**
+    > "My DataReaderListener crashes with SIGSEGV when I access msg.data. 
+    > Here's my on_data_available implementation: [code]
+    > Error occurs at line 45 when processing dispose notifications."
+
+    Without knowing what "not work" means, I can only guess. The code shown
+    could fail for many reasons:
+    - `thing` is nullptr
+    - `do_stuff()` throws an exception
+    - `process()` has a bug
+    - Type mismatch in `auto x`
+  metadata:
+    task_type: clarification_needed
+    corrects: bad_example_10
+    difficulty: easy
+
+- instruction: >
+    Is OpenDDS better than ROS2?
+  input: ""
+  output: |
+    This comparison requires context - they serve different purposes:
+
+    **OpenDDS:**
+    - Pure DDS implementation (OMG standard)
+    - Middleware layer only
+    - Language support: C++, Java
+    - Use case: Generic pub/sub communication
+
+    **ROS2:**
+    - Complete robotics framework
+    - **Uses DDS underneath** (FastDDS, Cyclone DDS, or Connext by default)
+    - Adds: message definitions, build system, tools, robot-specific packages
+    - Language support: C++, Python
+    - Use case: Robotics applications
+
+    **They're not really competitors:**
+    - ROS2 is built ON TOP OF DDS implementations
+    - You can even use OpenDDS as ROS2's DDS layer
+
+    **Choose OpenDDS when:**
+    - You need pure DDS without robotics overhead
+    - Your application isn't robotics-related
+    - You want direct control over DDS features
+    - You need Java support
+
+    **Choose ROS2 when:**
+    - Building robotics applications
+    - You need the ROS ecosystem (navigation, perception, etc.)
+    - You want Python support
+    - You need visualization tools (RViz, rqt)
+
+    **To give a better recommendation, I need:**
+    - What kind of application are you building?
+    - What languages do you need?
+    - Do you need robotics-specific features?
+    - What are your latency/throughput requirements?
+  metadata:
+    task_type: comparison
+    corrects: bad_example_11
+    difficulty: easy
+
+# =============================================================================
+# CATEGORY 5 CORRECTIONS: Fixing Subtle Bugs
+# =============================================================================
+
+- instruction: >
+    Show me how to create a DataWriter with RELIABLE QoS.
+  input: ""
+  output: |
+    Here's the correct way to create a RELIABLE DataWriter in OpenDDS:
+
+    ```cpp
+    #include <dds/DCPS/Marked_Default_Qos.h>
+
+    // Get default QoS and modify for reliability
+    DDS::DataWriterQos dw_qos;
+    publisher->get_default_datawriter_qos(dw_qos);
+    dw_qos.reliability.kind = DDS::RELIABLE_RELIABILITY_QOS;
+    dw_qos.reliability.max_blocking_time.sec = 10;
+    dw_qos.reliability.max_blocking_time.nanosec = 0;
+    dw_qos.history.kind = DDS::KEEP_ALL_HISTORY_QOS;
+
+    // Create DataWriter with proper nil listener (not nullptr)
+    DDS::DataWriter_var writer = publisher->create_datawriter(
+        topic.in(),
+        dw_qos,
+        DDS::DataWriterListener::_nil(),  // Correct: use _nil(), not nullptr
+        OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+
+    // Always check if creation succeeded
+    if (CORBA::is_nil(writer.in())) {
+        ACE_ERROR((LM_ERROR, "ERROR: create_datawriter failed\n"));
+        return 1;
+    }
+
+    // Narrow to typed writer and check result
+    MyMessageDataWriter_var typed_writer = MyMessageDataWriter::_narrow(writer.in());
+    if (CORBA::is_nil(typed_writer.in())) {
+        ACE_ERROR((LM_ERROR, "ERROR: _narrow failed\n"));
+        return 1;
+    }
+
+    // Register instance for better performance (optional but recommended)
+    MyMessage msg;
+    msg.id = 1;  // Set key field(s)
+    DDS::InstanceHandle_t handle = typed_writer->register_instance(msg);
+
+    // Now write data using the registered handle
+    msg.content = "Hello, DDS!";
+    DDS::ReturnCode_t ret = typed_writer->write(msg, handle);
+    if (ret != DDS::RETCODE_OK) {
+        ACE_ERROR((LM_ERROR, "ERROR: write failed: %d\n", ret));
+    }
+    ```
+
+    **Key points:**
+    1. Use `DDS::DataWriterListener::_nil()` not `nullptr` (CORBA compatibility)
+    2. Always check return values from `create_datawriter` and `_narrow`
+    3. Use `register_instance()` for better write performance
+    4. Set `max_blocking_time` to avoid infinite blocking
+    5. Use `KEEP_ALL_HISTORY_QOS` with RELIABLE for guaranteed delivery
+  metadata:
+    task_type: api_usage
+    corrects: bad_example_12
+    difficulty: medium
+
+- instruction: >
+    How do I wait for subscribers before publishing?
+  input: ""
+  output: |
+    The most efficient way is using **WaitSet with StatusCondition** (not busy-polling):
+
+    **Recommended: WaitSet approach (efficient, portable)**
+    ```cpp
+    #include <dds/DdsDcpsInfrastructureC.h>
+
+    // Create DataWriter first
+    DDS::DataWriter_var writer = pub->create_datawriter(
+        topic.in(), dw_qos, 
+        DDS::DataWriterListener::_nil(),
+        OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+
+    // Set up WaitSet with StatusCondition
+    DDS::StatusCondition_var status_cond = writer->get_statuscondition();
+    status_cond->set_enabled_statuses(DDS::PUBLICATION_MATCHED_STATUS);
+
+    DDS::WaitSet_var ws = new DDS::WaitSet();
+    ws->attach_condition(status_cond.in());
+
+    // Wait efficiently (blocks in kernel, no CPU usage)
+    DDS::ConditionSeq active_conditions;
+    DDS::Duration_t timeout = {30, 0};  // 30 second timeout
+
+    std::cout << "Waiting for subscriber..." << std::endl;
+
+    while (true) {
+        DDS::ReturnCode_t ret = ws->wait(active_conditions, timeout);
+        
+        if (ret == DDS::RETCODE_TIMEOUT) {
+            std::cerr << "Timeout waiting for subscriber" << std::endl;
+            break;
+        }
+        
+        if (ret != DDS::RETCODE_OK) {
+            std::cerr << "wait() failed: " << ret << std::endl;
+            break;
+        }
+
+        // Check if we have matched subscribers
+        DDS::PublicationMatchedStatus pms;
+        writer->get_publication_matched_status(pms);
+        
+        if (pms.current_count > 0) {
+            std::cout << "Matched " << pms.current_count 
+                      << " subscriber(s)" << std::endl;
+            break;
+        }
+    }
+
+    // Cleanup
+    ws->detach_condition(status_cond.in());
+
+    // Now safe to publish
+    typed_writer->write(msg, handle);
+    ```
+
+    **Why this is better than polling:**
+    
+    | Aspect | Polling Loop | WaitSet |
+    |--------|--------------|---------|
+    | CPU usage | Wastes CPU cycles | Zero (blocks in kernel) |
+    | Latency | Up to sleep interval | Immediate wake-up |
+    | Timeout | Must implement manually | Built-in support |
+    | Portability | `usleep` is POSIX-only | Cross-platform |
+
+    **Alternative: DataWriterListener (event-driven)**
+    ```cpp
+    class MyWriterListener : public DDS::DataWriterListener {
+    public:
+        void on_publication_matched(
+            DDS::DataWriter_ptr,
+            const DDS::PublicationMatchedStatus& status) override 
+        {
+            if (status.current_count > 0) {
+                std::cout << "Subscriber connected!" << std::endl;
+                // Signal your main thread
+            }
+        }
+        // ... implement other callbacks
+    };
+    ```
+  metadata:
+    task_type: api_usage
+    corrects: bad_example_13
+    difficulty: hard
