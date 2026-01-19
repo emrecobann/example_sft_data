@@ -1,0 +1,1985 @@
+# OpenDDS SFT Training Data
+# 15 high-quality examples for fine-tuning
+
+- instruction: >
+    Explain how the @topic and @key annotations work in OpenDDS IDL files
+    and why they're important for DDS communication.
+  input: |
+    File: examples/DCPS/IntroductionToOpenDDS/StockQuoter.idl
+
+    ```idl
+    module StockQuoter {
+
+      typedef unsigned long long TimeT;
+
+      @topic
+      struct Quote {
+        @key string ticker;
+        string exchange;
+        string full_name;
+        double value;
+        TimeT timestamp;
+      };
+
+      enum ExchangeEventType { TRADING_OPENED,
+                               TRADING_CLOSED,
+                               TRADING_SUSPENDED,
+                               TRADING_RESUMED };
+      @topic
+      struct ExchangeEvent {
+        @key string exchange;
+        ExchangeEventType event;
+        TimeT timestamp;
+      };
+    };
+    ```
+  output: |
+    The `@topic` and `@key` annotations in OpenDDS IDL serve critical roles in DDS communication:
+
+    **@topic annotation:**
+    - Marks a struct or union as a type that can be used for DDS topics
+    - Required for any type you want to publish/subscribe to
+    - Triggers OpenDDS code generation for TypeSupport, DataWriter, and DataReader classes
+    - In this example, both `Quote` and `ExchangeEvent` can be used as topic types
+
+    **@key annotation:**
+    - Identifies one or more fields that define DDS Instances within a topic
+    - Samples with the same key value belong to the same Instance
+    - Different key values represent different Instances
+    - Used for:
+      - Instance lifecycle management (register, dispose, unregister)
+      - QoS policies like HISTORY that operate per-instance
+      - Filtering and content-based subscriptions
+
+    **In this example:**
+    - `Quote` uses `ticker` as the key, so each stock symbol ("SPY", "MDY") is a separate Instance
+    - `ExchangeEvent` uses `exchange` as the key, so events are grouped by exchange name
+    - With default QoS, new samples replace previous values for the same Instance
+
+    **Why this matters:**
+    When the publisher calls `register_instance()` with a `Quote` having `ticker="SPY"`, it creates an Instance. All subsequent writes with `ticker="SPY"` update that same Instance, enabling proper instance-based history management and lifecycle tracking.
+  metadata:
+    task_type: code_explanation
+    files:
+      - examples/DCPS/IntroductionToOpenDDS/StockQuoter.idl
+    difficulty: easy
+
+- instruction: >
+    I'm implementing a DataReaderListener in OpenDDS. Explain the on_data_available
+    callback pattern and how to properly read samples.
+  input: |
+    File: examples/DCPS/IntroductionToOpenDDS/QuoteDataReaderListenerImpl.cpp
+
+    ```cpp
+    void QuoteDataReaderListenerImpl::on_data_available(DDS::DataReader_ptr reader)
+    {
+      try {
+        StockQuoter::QuoteDataReader_var quote_dr
+          = StockQuoter::QuoteDataReader::_narrow(reader);
+        if (CORBA::is_nil (quote_dr.in ())) {
+          cerr << "QuoteDataReaderListenerImpl::on_data_available: _narrow failed." << endl;
+          ACE_OS::exit(1);
+        }
+
+        int count = 0;
+        while(true) {
+          StockQuoter::Quote quote;
+          DDS::SampleInfo si ;
+          DDS::ReturnCode_t status = quote_dr->take_next_sample(quote, si) ;
+
+          if (status == DDS::RETCODE_OK && si.valid_data) {
+            ++count;
+            cout << "Quote: ticker    = " << quote.ticker.in()    << endl;
+            // ... process data
+          } else if (status == DDS::RETCODE_NO_DATA) {
+            cerr << "INFO: reading complete after " << count << " samples." << endl;
+            break;
+          } else {
+            cerr << "ERROR: read Quote: Error: " <<  status << endl;
+          }
+        }
+      } catch (CORBA::Exception& e) {
+        cerr << "Exception caught in read:" << endl << e << endl;
+        ACE_OS::exit(1);
+      }
+    }
+    ```
+  output: |
+    The `on_data_available` callback is the primary mechanism for receiving data in OpenDDS. Here's the pattern breakdown:
+
+    **1. Narrow the DataReader:**
+    ```cpp
+    StockQuoter::QuoteDataReader_var quote_dr
+      = StockQuoter::QuoteDataReader::_narrow(reader);
+    ```
+    The callback receives a generic `DDS::DataReader_ptr`. You must narrow it to your type-specific DataReader to access typed read/take operations.
+
+    **2. Loop to drain all available samples:**
+    ```cpp
+    while(true) {
+      DDS::ReturnCode_t status = quote_dr->take_next_sample(quote, si);
+      if (status == DDS::RETCODE_NO_DATA) break;
+      // process...
+    }
+    ```
+    Multiple samples may be available when the callback fires. Always loop until `RETCODE_NO_DATA`.
+
+    **3. Check SampleInfo.valid_data:**
+    ```cpp
+    if (status == DDS::RETCODE_OK && si.valid_data) {
+    ```
+    `valid_data` is `false` for dispose/unregister notifications where no actual data payload exists. Only access `quote` fields when `valid_data` is `true`.
+
+    **4. take vs read:**
+    - `take_next_sample()` removes the sample from the DataReader's cache
+    - `read_next_sample()` leaves the sample (useful for KEEP_ALL history)
+
+    **5. SampleInfo fields:**
+    - `sample_rank`: position in instance history (0 = most recent)
+    - `instance_handle`: identifies the DDS Instance
+    - `publication_handle`: identifies the DataWriter that sent it
+    - `source_timestamp`: when the sample was written
+
+    **Best practice:** Wrap the entire callback in try-catch since exceptions here can crash the middleware thread.
+  metadata:
+    task_type: code_explanation
+    files:
+      - examples/DCPS/IntroductionToOpenDDS/QuoteDataReaderListenerImpl.cpp
+    difficulty: medium
+
+- instruction: >
+    Show me how to create a basic OpenDDS publisher that registers types,
+    creates topics, and writes data.
+  input: |
+    I need to publish stock quote data using the StockQuoter.idl types.
+    What's the proper sequence of OpenDDS API calls?
+  output: |
+    Here's the complete publisher pattern from the IntroductionToOpenDDS example:
+
+    **1. Initialize and create DomainParticipant:**
+    ```cpp
+    #include "StockQuoterTypeSupportImpl.h"
+    #include <dds/DCPS/Service_Participant.h>
+    #include <dds/DCPS/Marked_Default_Qos.h>
+
+    DDS::DomainParticipantFactory_var dpf = TheParticipantFactoryWithArgs(argc, argv);
+
+    DDS::DomainParticipant_var participant = dpf->create_participant(
+      QUOTER_DOMAIN_ID,           // Domain ID (e.g., 1066)
+      PARTICIPANT_QOS_DEFAULT,
+      DDS::DomainParticipantListener::_nil(),
+      OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+    ```
+
+    **2. Create Publisher:**
+    ```cpp
+    DDS::Publisher_var pub = participant->create_publisher(
+      PUBLISHER_QOS_DEFAULT,
+      DDS::PublisherListener::_nil(),
+      OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+    ```
+
+    **3. Register the type:**
+    ```cpp
+    StockQuoter::QuoteTypeSupport_var quote_servant
+      = new StockQuoter::QuoteTypeSupportImpl();
+    quote_servant->register_type(participant.in(), "Quote Type");
+    ```
+
+    **4. Create Topic:**
+    ```cpp
+    DDS::Topic_var quote_topic = participant->create_topic(
+      "Stock Quotes",        // Topic name
+      "Quote Type",          // Registered type name
+      TOPIC_QOS_DEFAULT,
+      DDS::TopicListener::_nil(),
+      OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+    ```
+
+    **5. Create DataWriter:**
+    ```cpp
+    DDS::DataWriter_var quote_base_dw = pub->create_datawriter(
+      quote_topic.in(),
+      DATAWRITER_QOS_DEFAULT,
+      DDS::DataWriterListener::_nil(),
+      OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+
+    StockQuoter::QuoteDataWriter_var quote_dw
+      = StockQuoter::QuoteDataWriter::_narrow(quote_base_dw.in());
+    ```
+
+    **6. Register instance and write:**
+    ```cpp
+    StockQuoter::Quote spy;
+    spy.ticker = CORBA::string_dup("SPY");
+    DDS::InstanceHandle_t spy_handle = quote_dw->register_instance(spy);
+
+    spy.exchange = STOCK_EXCHANGE_NAME;
+    spy.full_name = CORBA::string_dup("S&P Depository Receipts");
+    spy.value = 1200.0;
+    spy.timestamp = get_timestamp();
+
+    DDS::ReturnCode_t ret = quote_dw->write(spy, spy_handle);
+    if (ret != DDS::RETCODE_OK) {
+      ACE_ERROR((LM_ERROR, "ERROR: write returned %d.\n", ret));
+    }
+    ```
+
+    **7. Cleanup:**
+    ```cpp
+    participant->delete_contained_entities();
+    dpf->delete_participant(participant.in());
+    TheServiceParticipant->shutdown();
+    ```
+
+    **Key points:**
+    - `register_instance()` is optional but improves performance for repeated writes
+    - Always check return codes from `write()`
+    - Call `shutdown()` on `TheServiceParticipant` before exiting
+  metadata:
+    task_type: api_usage
+    files:
+      - examples/DCPS/IntroductionToOpenDDS/publisher.cpp
+      - examples/DCPS/IntroductionToOpenDDS/StockQuoter.idl
+    difficulty: medium
+
+- instruction: >
+    The DataReaderListener callback is not receiving any data. How do I debug
+    association issues between my publisher and subscriber?
+  input: |
+    My subscriber's on_data_available is never called even though the publisher
+    is running. Both are using domain ID 111 and the same topic name.
+  output: |
+    Here's a systematic debugging approach for OpenDDS association failures:
+
+    **1. Enable Debug Logging:**
+    In your configuration file or via command line:
+    ```ini
+    [common]
+    DCPSDebugLevel=5
+    ```
+    Or: `-DCPSDebugLevel 5`
+
+    This reveals discovery and association events.
+
+    **2. Verify Domain ID Match:**
+    Both publisher and subscriber must use the identical domain ID:
+    ```cpp
+    // Publisher
+    participant = dpf->create_participant(111, ...);
+    // Subscriber - must also be 111
+    participant = dpf->create_participant(111, ...);
+    ```
+
+    **3. Verify Type Name and Topic Name Match Exactly:**
+    ```cpp
+    // Publisher
+    servant->register_type(participant.in(), "MyType");  // Type name
+    participant->create_topic("MyTopic", "MyType", ...); // Topic name, type name
+
+    // Subscriber must use identical strings
+    servant->register_type(participant.in(), "MyType");
+    participant->create_topic("MyTopic", "MyType", ...);
+    ```
+
+    **4. Check QoS Compatibility:**
+    Common incompatibilities:
+    - Reliability: Writer offers BEST_EFFORT, Reader requests RELIABLE
+    - Durability: Writer offers VOLATILE, Reader requests TRANSIENT_LOCAL
+
+    Add `on_requested_incompatible_qos` listener to detect:
+    ```cpp
+    void MyListener::on_requested_incompatible_qos(
+        DDS::DataReader_ptr,
+        const DDS::RequestedIncompatibleQosStatus& status) {
+      cerr << "Incompatible QoS! Policy ID: " << status.last_policy_id << endl;
+    }
+    ```
+
+    **5. Verify Transport Configuration:**
+    Check that both use compatible transports:
+    ```ini
+    [config/config1]
+    transports=tcp1
+
+    [transport/tcp1]
+    transport_type=tcp
+    ```
+    Both processes need matching transport configurations.
+
+    **6. Check for Discovery Issues:**
+    For InfoRepo discovery:
+    ```ini
+    [common]
+    DCPSInfoRepo=corbaloc::localhost:12345/DCPSInfoRepo
+    ```
+    Ensure InfoRepo is running and accessible to both.
+
+    For RTPS discovery (peer-to-peer):
+    ```ini
+    [common]
+    DCPSDefaultDiscovery=DEFAULT_RTPS
+    ```
+
+    **7. Wait for Association:**
+    In Writer.cpp pattern - wait for matched subscriptions:
+    ```cpp
+    DDS::InstanceHandleSeq handles;
+    while (true) {
+      writer_->get_matched_subscriptions(handles);
+      if (handles.length() > 0) break;
+      ACE_OS::sleep(ACE_Time_Value(0, 200000));
+    }
+    ```
+
+    **8. Verify Listener is Attached:**
+    ```cpp
+    DDS::DataReader_var dr = sub->create_datareader(
+      topic.in(),
+      dr_qos,
+      listener.in(),  // Must not be nil!
+      OpenDDS::DCPS::DEFAULT_STATUS_MASK);  // Must include DATA_AVAILABLE
+    ```
+  metadata:
+    task_type: debugging
+    files:
+      - examples/DCPS/Messenger_Imr/Writer.cpp
+      - examples/DCPS/IntroductionToOpenDDS/dds_tcp_conf.ini
+    difficulty: medium
+
+- instruction: >
+    Fix the bug in this on_data_available implementation that can cause a crash
+    when receiving dispose notifications.
+  input: |
+    File: buggy_listener.cpp
+
+    ```cpp
+    void MyDataReaderListenerImpl::on_data_available(DDS::DataReader_ptr reader)
+    {
+      Messenger::MessageDataReader_var message_dr = 
+        Messenger::MessageDataReader::_narrow(reader);
+      
+      Messenger::Message message;
+      DDS::SampleInfo si;
+      DDS::ReturnCode_t status = message_dr->take_next_sample(message, si);
+
+      if (status == DDS::RETCODE_OK) {
+        // Bug: accessing message fields without checking valid_data
+        cout << "Received message from: " << message.from.in() << endl;
+        cout << "Subject: " << message.subject.in() << endl;
+        cout << "Count: " << message.count << endl;
+        process_message(message);
+      }
+    }
+    ```
+  output: |
+    **The Bug:**
+    The code accesses `message` fields without checking `si.valid_data`. When a DataWriter disposes or unregisters an instance, `on_data_available` is called but `valid_data` is `false` and the `message` struct contains uninitialized/garbage data. Accessing `message.from.in()` on invalid data causes undefined behavior (likely crash).
+
+    **Fixed Code:**
+    ```cpp
+    void MyDataReaderListenerImpl::on_data_available(DDS::DataReader_ptr reader)
+    {
+      try {
+        Messenger::MessageDataReader_var message_dr = 
+          Messenger::MessageDataReader::_narrow(reader);
+        
+        if (CORBA::is_nil(message_dr.in())) {
+          ACE_ERROR((LM_ERROR, "on_data_available: _narrow failed\n"));
+          return;
+        }
+
+        Messenger::Message message;
+        DDS::SampleInfo si;
+        
+        // Loop to drain all available samples
+        while (true) {
+          DDS::ReturnCode_t status = message_dr->take_next_sample(message, si);
+          
+          if (status == DDS::RETCODE_NO_DATA) {
+            break;  // No more samples
+          }
+          
+          if (status != DDS::RETCODE_OK) {
+            ACE_ERROR((LM_ERROR, "take_next_sample error: %d\n", status));
+            break;
+          }
+
+          // CRITICAL: Check valid_data before accessing message fields
+          if (si.valid_data) {
+            cout << "Received message from: " << message.from.in() << endl;
+            cout << "Subject: " << message.subject.in() << endl;
+            cout << "Count: " << message.count << endl;
+            process_message(message);
+          } else {
+            // Handle instance state change (dispose/unregister)
+            if (si.instance_state == DDS::NOT_ALIVE_DISPOSED_INSTANCE_STATE) {
+              cout << "Instance disposed by writer" << endl;
+            } else if (si.instance_state == DDS::NOT_ALIVE_NO_WRITERS_INSTANCE_STATE) {
+              cout << "Instance has no writers" << endl;
+            }
+          }
+        }
+      } catch (CORBA::Exception& e) {
+        ACE_ERROR((LM_ERROR, "Exception in on_data_available: %C\n", e._info().c_str()));
+      }
+    }
+    ```
+
+    **Key Fixes:**
+    1. **Check `si.valid_data`** before accessing any message fields
+    2. **Add null check** after `_narrow()` for defensive coding
+    3. **Loop until `RETCODE_NO_DATA`** - multiple samples may be available
+    4. **Wrap in try-catch** - exceptions in listener can crash middleware
+    5. **Handle instance state changes** when `valid_data` is false
+
+    **When `valid_data` is false:**
+    - `instance_state` indicates why (disposed, no writers)
+    - `instance_handle` identifies which instance
+    - The data fields are NOT valid and must not be accessed
+  metadata:
+    task_type: bug_fixing
+    files:
+      - examples/DCPS/Messenger_Imr/DataReaderListener.cpp
+      - examples/DCPS/IntroductionToOpenDDS/QuoteDataReaderListenerImpl.cpp
+    difficulty: medium
+
+- instruction: >
+    How do I configure OpenDDS to use TCP transport with a specific configuration file?
+  input: |
+    I want to set up TCP transport for my OpenDDS application.
+    What configuration file format should I use and how do I reference it?
+  output: |
+    Here's how to configure OpenDDS TCP transport:
+
+    **1. Create configuration file (e.g., `dds_tcp_conf.ini`):**
+    ```ini
+    # Global settings
+    [common]
+    DCPSDebugLevel=0
+    DCPSInfoRepo=corbaloc::localhost:12345/DCPSInfoRepo
+    DCPSGlobalTransportConfig=config1
+
+    # Transport configuration - groups transport instances
+    [config/config1]
+    transports=tcp1
+
+    # TCP transport instance with default settings
+    [transport/tcp1]
+    transport_type=tcp
+    ```
+
+    **2. Reference the config file at runtime:**
+
+    **Option A: Command-line argument:**
+    ```bash
+    ./publisher -DCPSConfigFile dds_tcp_conf.ini
+    ```
+
+    **Option B: Environment variable:**
+    ```bash
+    export OPENDDS_DCPS_CONFIG_FILE=dds_tcp_conf.ini
+    ./publisher
+    ```
+
+    **3. Ensure transport is linked in your code:**
+    ```cpp
+    // Include static transport initializer
+    #include "dds/DCPS/StaticIncludes.h"
+    // Or link against OpenDDS_Tcp library
+    ```
+
+    **4. MPC project file (for build system):**
+    ```mpc
+    project(*Publisher) : dcpsexe, dcps_tcp {
+      // dcps_tcp base project links the TCP transport
+      ...
+    }
+    ```
+
+    **Advanced TCP configuration options:**
+    ```ini
+    [transport/tcp1]
+    transport_type=tcp
+    local_address=192.168.1.100:9000  # Bind address
+    pub_address=192.168.1.100:9000    # Advertised address (for NAT)
+    conn_retry_initial_delay=500      # ms before first reconnect attempt
+    conn_retry_backoff_multiplier=2.0 # Backoff factor for retries
+    conn_retry_attempts=3             # Max reconnection attempts
+    max_output_pause_period=0         # 0 = block until sent
+    passive_reconnect_duration=2000   # ms to wait for reconnect
+    ```
+
+    **For RTPS (peer-to-peer, no InfoRepo):**
+    ```ini
+    [common]
+    DCPSDefaultDiscovery=DEFAULT_RTPS
+    DCPSGlobalTransportConfig=config1
+
+    [config/config1]
+    transports=rtps_transport
+
+    [transport/rtps_transport]
+    transport_type=rtps_udp
+    ```
+
+    **Configuration hierarchy:**
+    1. `[common]` - Process-wide settings
+    2. `[config/name]` - Named transport configuration (groups instances)
+    3. `[transport/name]` - Individual transport instance settings
+
+    The `DCPSGlobalTransportConfig` in `[common]` sets the default config for all entities unless overridden per-entity.
+  metadata:
+    task_type: build_configuration
+    files:
+      - examples/DCPS/IntroductionToOpenDDS/dds_tcp_conf.ini
+      - examples/DCPS/IntroductionToOpenDDS/StockQuoter.mpc
+    difficulty: easy
+
+- instruction: >
+    Explain the MPC project file structure for building an OpenDDS application
+    with custom IDL types.
+  input: |
+    File: examples/DCPS/IntroductionToOpenDDS/StockQuoter.mpc
+
+    ```mpc
+    project(*Common) : dcps_idl_only_lib {
+      sharedname     = StockQuoterCommon
+      dynamicflags   = STOCKQUOTERCOMMON_BUILD_DLL
+      requires += tao_orbsvcs
+      requires += no_opendds_safety_profile
+      after    += Svc_Utils
+      includes      += $(TAO_ROOT)/orbsvcs
+      idlflags      += -I$(TAO_ROOT)/orbsvcs \
+                       -Wb,export_macro=StockQuoterCommon_Export \
+                       -Wb,export_include=StockQuoterCommon_Export.h
+      dcps_ts_flags += -Wb,export_macro=StockQuoterCommon_Export
+
+      TypeSupport_Files {
+        StockQuoter.idl
+      }
+
+      IDL_Files {
+        StockQuoterTypeSupport.idl
+        StockQuoter.idl
+      }
+    }
+
+    project(*Publisher) : dcpsexe, dcps_tcp, svc_utils {
+      after    += *Common
+      exename   = publisher
+      includes += $(TAO_ROOT)/orbsvcs
+      libs     += StockQuoterCommon
+
+      Source_Files {
+        publisher.cpp
+      }
+    }
+    ```
+  output: |
+    This MPC file defines a multi-project build for an OpenDDS application. Here's the breakdown:
+
+    **Project 1: `*Common` - Shared IDL Library**
+
+    ```mpc
+    project(*Common) : dcps_idl_only_lib {
+    ```
+    - `*Common` - Project name (asterisk inherits from workspace name)
+    - `dcps_idl_only_lib` - Base project for IDL-only shared libraries
+
+    ```mpc
+      sharedname     = StockQuoterCommon
+      dynamicflags   = STOCKQUOTERCOMMON_BUILD_DLL
+    ```
+    - Creates `StockQuoterCommon.dll` (Windows) or `libStockQuoterCommon.so` (Linux)
+    - `dynamicflags` defines the DLL export macro during compilation
+
+    ```mpc
+      idlflags      += -Wb,export_macro=StockQuoterCommon_Export \
+                       -Wb,export_include=StockQuoterCommon_Export.h
+      dcps_ts_flags += -Wb,export_macro=StockQuoterCommon_Export
+    ```
+    - Configures IDL compilers to use proper DLL export macros
+    - `idlflags` for TAO IDL compiler
+    - `dcps_ts_flags` for OpenDDS IDL compiler
+
+    ```mpc
+      TypeSupport_Files {
+        StockQuoter.idl
+      }
+    ```
+    - **Key section**: Lists IDL files for OpenDDS type support generation
+    - Generates: `StockQuoterTypeSupportImpl.h/.cpp`, `StockQuoterTypeSupport.idl`
+
+    ```mpc
+      IDL_Files {
+        StockQuoterTypeSupport.idl
+        StockQuoter.idl
+      }
+    ```
+    - IDL files processed by TAO IDL compiler
+    - Generates: `*C.h`, `*C.cpp`, `*S.h`, `*S.cpp`
+
+    **Project 2: `*Publisher` - Executable**
+
+    ```mpc
+    project(*Publisher) : dcpsexe, dcps_tcp, svc_utils {
+    ```
+    - `dcpsexe` - Base project for OpenDDS executables
+    - `dcps_tcp` - Links TCP transport
+    - `svc_utils` - TAO ORB services utilities
+
+    ```mpc
+      after    += *Common
+      libs     += StockQuoterCommon
+    ```
+    - Build dependency: compile `*Common` first
+    - Link against the generated shared library
+
+    **To build:**
+    ```bash
+    # Generate makefiles/solution
+    $ACE_ROOT/bin/mwc.pl -type gnuace  # Linux
+    %ACE_ROOT%\bin\mwc.pl -type vs2019  # Windows
+
+    # Build
+    make  # Linux
+    msbuild StockQuoter.sln  # Windows
+    ```
+
+    **Common base projects:**
+    - `dcps` - Core OpenDDS
+    - `dcps_tcp` - TCP transport
+    - `dcps_udp` - UDP transport
+    - `dcps_rtps` - RTPS transport
+    - `dcpsexe` - Executable with OpenDDS
+    - `dcps_idl_only_lib` - IDL library only
+  metadata:
+    task_type: build_configuration
+    files:
+      - examples/DCPS/IntroductionToOpenDDS/StockQuoter.mpc
+    difficulty: medium
+
+- instruction: >
+    Refactor this polling-based subscription termination to use a proper
+    DDS condition with WaitSet.
+  input: |
+    File: examples/DCPS/IntroductionToOpenDDS/subscriber.cpp (current approach)
+
+    ```cpp
+    // Wait for events from the Publisher; shut down when "close" received
+    cout << "Subscriber: waiting for events" << endl;
+    while ( ! listener_servant->is_exchange_closed_received() ) {
+      ACE_OS::sleep(1);
+    }
+    cout << "Received CLOSED event from publisher; exiting..." << endl;
+    ```
+
+    The subscriber currently polls a flag in the listener every second.
+    This wastes CPU and has up to 1 second latency.
+  output: |
+    Here's a refactored version using DDS GuardCondition with WaitSet for efficient, low-latency waiting:
+
+    **1. Add GuardCondition to the listener:**
+    ```cpp
+    // ExchangeEventDataReaderListenerImpl.h
+    class ExchangeEventDataReaderListenerImpl 
+      : public virtual OpenDDS::DCPS::LocalObject<DDS::DataReaderListener> {
+    public:
+      ExchangeEventDataReaderListenerImpl();
+      
+      // Existing methods...
+      void on_data_available(DDS::DataReader_ptr reader) override;
+      
+      // Replace is_exchange_closed_received() with condition
+      DDS::GuardCondition_ptr get_close_condition() { return close_condition_.in(); }
+
+    private:
+      DDS::GuardCondition_var close_condition_;
+    };
+    ```
+
+    **2. Initialize and trigger in listener implementation:**
+    ```cpp
+    // ExchangeEventDataReaderListenerImpl.cpp
+    ExchangeEventDataReaderListenerImpl::ExchangeEventDataReaderListenerImpl()
+      : close_condition_(new DDS::GuardCondition())
+    {
+    }
+
+    void ExchangeEventDataReaderListenerImpl::on_data_available(DDS::DataReader_ptr reader)
+    {
+      // ... existing narrow and take code ...
+      
+      if (status == DDS::RETCODE_OK && si.valid_data) {
+        if (exchange_event.event == StockQuoter::TRADING_CLOSED) {
+          // Signal the condition instead of setting a flag
+          close_condition_->set_trigger_value(true);
+        }
+      }
+    }
+    ```
+
+    **3. Use WaitSet in main subscriber code:**
+    ```cpp
+    // subscriber.cpp - replace the polling loop
+    #include <dds/DdsDcpsInfrastructureC.h>
+
+    // After creating DataReaders...
+
+    // Create WaitSet and attach the close condition
+    DDS::WaitSet_var ws = new DDS::WaitSet();
+    DDS::GuardCondition_var close_cond = listener_servant->get_close_condition();
+    DDS::ReturnCode_t ret = ws->attach_condition(close_cond.in());
+    if (ret != DDS::RETCODE_OK) {
+      cerr << "attach_condition failed" << endl;
+      return 1;
+    }
+
+    cout << "Subscriber: waiting for TRADING_CLOSED event" << endl;
+
+    // Wait efficiently (blocks until condition triggers or timeout)
+    DDS::ConditionSeq active_conditions;
+    DDS::Duration_t timeout = { DDS::DURATION_INFINITE_SEC, DDS::DURATION_INFINITE_NSEC };
+
+    ret = ws->wait(active_conditions, timeout);
+
+    if (ret == DDS::RETCODE_OK) {
+      for (CORBA::ULong i = 0; i < active_conditions.length(); ++i) {
+        if (active_conditions[i] == close_cond.in()) {
+          cout << "Received TRADING_CLOSED event; exiting..." << endl;
+        }
+      }
+    } else if (ret == DDS::RETCODE_TIMEOUT) {
+      cout << "Wait timed out" << endl;
+    }
+
+    // Cleanup
+    ws->detach_condition(close_cond.in());
+    ```
+
+    **Benefits of this refactoring:**
+    1. **Zero CPU usage while waiting** - blocks in kernel, no polling
+    2. **Immediate response** - wakes up instantly when condition triggers
+    3. **Scalable** - can attach multiple conditions to one WaitSet
+    4. **Timeout support** - can set maximum wait duration
+    5. **Standard DDS pattern** - portable across DDS implementations
+
+    **Alternative: Use StatusCondition**
+    For data availability (instead of custom events):
+    ```cpp
+    DDS::StatusCondition_var sc = reader->get_statuscondition();
+    sc->set_enabled_statuses(DDS::DATA_AVAILABLE_STATUS);
+    ws->attach_condition(sc.in());
+    ```
+  metadata:
+    task_type: refactoring
+    files:
+      - examples/DCPS/IntroductionToOpenDDS/subscriber.cpp
+    difficulty: hard
+
+- instruction: >
+    How do I implement a DataWriter that waits for matched subscriptions
+    before publishing data?
+  input: |
+    I'm seeing that my published samples are sometimes lost because the
+    subscriber hasn't connected yet. How can I ensure the DataWriter waits
+    for at least one subscriber?
+  output: |
+    The Messenger_Imr example demonstrates the pattern for waiting for matched subscriptions:
+
+    **Pattern 1: Poll for matched subscriptions (simple)**
+    ```cpp
+    // From examples/DCPS/Messenger_Imr/Writer.cpp
+    DDS::InstanceHandleSeq handles;
+    while (true) {
+      writer_->get_matched_subscriptions(handles);
+      if (handles.length() > 0) {
+        break;  // At least one subscriber matched
+      }
+      ACE_OS::sleep(ACE_Time_Value(0, 200000));  // 200ms
+    }
+
+    // Now safe to write
+    MessageDataWriter_var message_dw = MessageDataWriter::_narrow(writer_.in());
+    message_dw->write(message, handle);
+    ```
+
+    **Pattern 2: Use DataWriterListener (event-driven)**
+    ```cpp
+    class MyDataWriterListener : public virtual OpenDDS::DCPS::LocalObject<DDS::DataWriterListener> {
+    public:
+      MyDataWriterListener() : matched_(false), mutex_(), cv_() {}
+
+      void on_publication_matched(
+          DDS::DataWriter_ptr,
+          const DDS::PublicationMatchedStatus& status) override
+      {
+        ACE_Guard<ACE_Thread_Mutex> guard(mutex_);
+        if (status.current_count > 0) {
+          matched_ = true;
+          cv_.signal();
+        }
+      }
+
+      void wait_for_match() {
+        ACE_Guard<ACE_Thread_Mutex> guard(mutex_);
+        while (!matched_) {
+          cv_.wait(mutex_);
+        }
+      }
+
+      // Implement other required callbacks (can be empty)
+      void on_offered_deadline_missed(DDS::DataWriter_ptr, 
+          const DDS::OfferedDeadlineMissedStatus&) override {}
+      void on_offered_incompatible_qos(DDS::DataWriter_ptr,
+          const DDS::OfferedIncompatibleQosStatus&) override {}
+      void on_liveliness_lost(DDS::DataWriter_ptr,
+          const DDS::LivelinessLostStatus&) override {}
+
+    private:
+      bool matched_;
+      ACE_Thread_Mutex mutex_;
+      ACE_Condition_Thread_Mutex cv_;
+    };
+
+    // Usage:
+    MyDataWriterListener* listener_impl = new MyDataWriterListener();
+    DDS::DataWriterListener_var listener(listener_impl);
+
+    DDS::DataWriter_var dw = pub->create_datawriter(
+        topic.in(), dw_qos, listener.in(),
+        DDS::PUBLICATION_MATCHED_STATUS);  // Only listen for this status
+
+    listener_impl->wait_for_match();  // Blocks until subscriber connects
+    // Now write data...
+    ```
+
+    **Pattern 3: Use WaitSet with StatusCondition**
+    ```cpp
+    // Create DataWriter
+    DDS::DataWriter_var writer = pub->create_datawriter(
+        topic.in(), dw_qos, DDS::DataWriterListener::_nil(),
+        OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+
+    // Set up WaitSet with status condition
+    DDS::StatusCondition_var status_cond = writer->get_statuscondition();
+    status_cond->set_enabled_statuses(DDS::PUBLICATION_MATCHED_STATUS);
+
+    DDS::WaitSet_var ws = new DDS::WaitSet();
+    ws->attach_condition(status_cond.in());
+
+    // Wait for match
+    DDS::ConditionSeq active;
+    DDS::Duration_t timeout = {30, 0};  // 30 second timeout
+
+    while (true) {
+      DDS::ReturnCode_t ret = ws->wait(active, timeout);
+      if (ret == DDS::RETCODE_TIMEOUT) {
+        cerr << "Timeout waiting for subscriber" << endl;
+        break;
+      }
+      
+      DDS::PublicationMatchedStatus pms;
+      writer->get_publication_matched_status(pms);
+      if (pms.current_count > 0) {
+        cout << "Matched " << pms.current_count << " subscriber(s)" << endl;
+        break;
+      }
+    }
+
+    ws->detach_condition(status_cond.in());
+    // Now write data...
+    ```
+
+    **Also wait at shutdown to ensure delivery:**
+    ```cpp
+    // After last write, wait for subscribers to disconnect
+    while (true) {
+      writer_->get_matched_subscriptions(handles);
+      if (handles.length() == 0) {
+        break;  // All subscribers received data and disconnected
+      }
+      ACE_OS::sleep(1);
+    }
+    ```
+  metadata:
+    task_type: api_usage
+    files:
+      - examples/DCPS/Messenger_Imr/Writer.cpp
+    difficulty: medium
+
+- instruction: >
+    What is the proper cleanup sequence for OpenDDS entities to avoid
+    resource leaks and crashes?
+  input: |
+    My application sometimes crashes on shutdown. What's the correct order
+    to clean up DDS entities?
+  output: |
+    Proper cleanup order is critical in OpenDDS. Follow this sequence (reverse of creation order):
+
+    **Correct cleanup sequence:**
+    ```cpp
+    // From examples/DCPS/IntroductionToOpenDDS/publisher.cpp
+    try {
+      // 1. Delete all entities created by the participant
+      if (!CORBA::is_nil(participant.in())) {
+        participant->delete_contained_entities();
+      }
+      
+      // 2. Delete the participant from the factory
+      if (!CORBA::is_nil(dpf.in())) {
+        dpf->delete_participant(participant.in());
+      }
+    } catch (CORBA::Exception& e) {
+      cerr << "Exception caught in cleanup." << endl << e << endl;
+    }
+
+    // 3. Shutdown the service participant (MUST be last)
+    TheServiceParticipant->shutdown();
+    ```
+
+    **What `delete_contained_entities()` does:**
+    - Deletes all Publishers, Subscribers, Topics created by that participant
+    - Each Publisher's DataWriters are deleted
+    - Each Subscriber's DataReaders are deleted
+    - Listeners are released
+    - Recursive cleanup of the entire entity tree
+
+    **Manual cleanup (if not using `delete_contained_entities()`):**
+    ```cpp
+    // Must delete in correct order:
+
+    // 1. Unregister instances (optional, for proper lifecycle)
+    quote_dw->unregister_instance(quote, handle);
+
+    // 2. Delete DataWriters before Publisher
+    pub->delete_datawriter(quote_dw.in());
+
+    // 3. Delete DataReaders before Subscriber
+    sub->delete_datareader(quote_dr.in());
+
+    // 4. Delete Publisher and Subscriber before Topics
+    participant->delete_publisher(pub.in());
+    participant->delete_subscriber(sub.in());
+
+    // 5. Delete Topics before Participant
+    participant->delete_topic(quote_topic.in());
+
+    // 6. Delete Participant
+    dpf->delete_participant(participant.in());
+
+    // 7. Shutdown service participant
+    TheServiceParticipant->shutdown();
+    ```
+
+    **Common crash causes and fixes:**
+
+    **1. Listener outlives entity:**
+    ```cpp
+    // BAD: Listener deleted before DataReader
+    DDS::DataReaderListener_var listener(new MyListener());
+    DDS::DataReader_var dr = sub->create_datareader(..., listener.in(), ...);
+    listener = DDS::DataReaderListener::_nil();  // Releases listener!
+    // dr still holds raw pointer - CRASH when callback fires
+
+    // GOOD: Let _var prevent premature deletion
+    DDS::DataReaderListener_var listener(new MyListener());
+    // listener _var prevents deletion until all references released
+    ```
+
+    **2. Forgetting to shutdown:**
+    ```cpp
+    // BAD: Missing shutdown causes resource leak
+    return 0;
+
+    // GOOD: Always call shutdown
+    TheServiceParticipant->shutdown();
+    return 0;
+    ```
+
+    **3. Deleting entities out of order:**
+    ```cpp
+    // BAD: Delete Topic while DataWriter still uses it
+    participant->delete_topic(topic.in());
+    pub->delete_datawriter(writer.in());  // Topic gone - undefined behavior
+
+    // GOOD: Delete writers first
+    pub->delete_datawriter(writer.in());
+    participant->delete_topic(topic.in());
+    ```
+
+    **4. Multiple participants in same process:**
+    ```cpp
+    // When using multiple participants, delete ALL before shutdown
+    participant1->delete_contained_entities();
+    dpf->delete_participant(participant1.in());
+
+    participant2->delete_contained_entities();
+    dpf->delete_participant(participant2.in());
+
+    // Only ONE shutdown call at the very end
+    TheServiceParticipant->shutdown();
+    ```
+
+    **Best practice: RAII wrapper**
+    ```cpp
+    class DDSGuard {
+    public:
+      DDSGuard(DDS::DomainParticipantFactory_var dpf, 
+               DDS::DomainParticipant_var dp)
+        : dpf_(dpf), dp_(dp) {}
+      
+      ~DDSGuard() {
+        if (!CORBA::is_nil(dp_.in())) {
+          dp_->delete_contained_entities();
+          dpf_->delete_participant(dp_.in());
+        }
+        TheServiceParticipant->shutdown();
+      }
+    private:
+      DDS::DomainParticipantFactory_var dpf_;
+      DDS::DomainParticipant_var dp_;
+    };
+    ```
+  metadata:
+    task_type: bug_fixing
+    files:
+      - examples/DCPS/IntroductionToOpenDDS/publisher.cpp
+      - examples/DCPS/IntroductionToOpenDDS/subscriber.cpp
+    difficulty: medium
+
+- instruction: >
+    How do I set up an OpenDDS subscriber that filters content using
+    a ContentFilteredTopic?
+  input: |
+    I want to receive only Quote samples where the value is above 1300.
+    How do I create a ContentFilteredTopic in OpenDDS?
+  output: |
+    Here's how to create a ContentFilteredTopic in OpenDDS:
+
+    **1. Create the base Topic first:**
+    ```cpp
+    // Register type and create normal topic
+    StockQuoter::QuoteTypeSupport_var quote_ts = new StockQuoter::QuoteTypeSupportImpl();
+    quote_ts->register_type(participant.in(), "Quote Type");
+
+    DDS::Topic_var quote_topic = participant->create_topic(
+        "Stock Quotes",
+        "Quote Type",
+        TOPIC_QOS_DEFAULT,
+        DDS::TopicListener::_nil(),
+        OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+    ```
+
+    **2. Create ContentFilteredTopic with SQL-like filter:**
+    ```cpp
+    // Filter expression - SQL-like WHERE clause
+    // Parameters are referenced as %0, %1, etc.
+    const char* filter_expression = "value > %0";
+
+    // Parameter values (as strings)
+    DDS::StringSeq filter_params;
+    filter_params.length(1);
+    filter_params[0] = "1300.0";  // Filter for value > 1300
+
+    DDS::ContentFilteredTopic_var filtered_topic = 
+        participant->create_contentfilteredtopic(
+            "High Value Quotes",      // Unique name for filtered topic
+            quote_topic.in(),          // Base topic
+            filter_expression,         // SQL-like filter
+            filter_params);            // Parameter values
+
+    if (CORBA::is_nil(filtered_topic.in())) {
+        cerr << "create_contentfilteredtopic failed" << endl;
+        return 1;
+    }
+    ```
+
+    **3. Create DataReader on the filtered topic:**
+    ```cpp
+    // Use the filtered topic instead of the base topic
+    DDS::DataReader_var quote_dr = sub->create_datareader(
+        filtered_topic.in(),  // ContentFilteredTopic, not Topic
+        DATAREADER_QOS_DEFAULT,
+        quote_listener.in(),
+        OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+    ```
+
+    **4. Dynamically update filter parameters:**
+    ```cpp
+    // Change threshold to 1500 at runtime
+    DDS::StringSeq new_params;
+    new_params.length(1);
+    new_params[0] = "1500.0";
+
+    DDS::ReturnCode_t ret = filtered_topic->set_expression_parameters(new_params);
+    if (ret != DDS::RETCODE_OK) {
+        cerr << "set_expression_parameters failed: " << ret << endl;
+    }
+    ```
+
+    **Supported filter expressions:**
+
+    ```cpp
+    // Comparison operators
+    "value > %0"
+    "value >= %0 AND value <= %1"  // Range
+    "ticker = %0"                   // String equality
+    "ticker <> %0"                  // Not equal
+
+    // Logical operators
+    "value > %0 AND exchange = %1"
+    "ticker = %0 OR ticker = %1"
+    "NOT (value < %0)"
+
+    // BETWEEN and IN (with RTPS)
+    "value BETWEEN %0 AND %1"
+    "ticker IN ('SPY', 'MDY', 'QQQ')"
+
+    // LIKE for pattern matching
+    "full_name LIKE 'S&P%'"  // Starts with 'S&P'
+    ```
+
+    **From ishapes example - rectangle filter:**
+    ```cpp
+    // ShapesDialog.cpp uses position-based filtering
+    const char* filter = "(x BETWEEN %0 AND %1) AND (y BETWEEN %2 AND %3)";
+
+    DDS::StringSeq params;
+    params.length(4);
+    params[0] = "100";  // x min
+    params[1] = "200";  // x max
+    params[2] = "100";  // y min
+    params[3] = "200";  // y max
+
+    DDS::ContentFilteredTopic_var cft = participant->create_contentfilteredtopic(
+        "FilteredShape", shape_topic.in(), filter, params);
+    ```
+
+    **Cleanup:**
+    ```cpp
+    // Delete in order: DataReader, then ContentFilteredTopic
+    sub->delete_datareader(quote_dr.in());
+    participant->delete_contentfilteredtopic(filtered_topic.in());
+    participant->delete_topic(quote_topic.in());
+    ```
+
+    **Important notes:**
+    - ContentFilteredTopic inherits from TopicDescription, not Topic
+    - Filtering happens on the subscriber side (not at publisher)
+    - Filter expressions reference IDL field names directly
+    - Parameters are always strings, converted to appropriate types
+    - Cannot create a DataWriter on a ContentFilteredTopic
+  metadata:
+    task_type: api_usage
+    files:
+      - examples/DCPS/ishapes/ShapesDialog.cpp
+      - examples/DCPS/IntroductionToOpenDDS/StockQuoter.idl
+    difficulty: hard
+
+- instruction: >
+    Navigate the OpenDDS codebase: where is the DataReaderImpl class defined
+    and what are its key responsibilities?
+  input: |
+    I need to understand the internal implementation of DataReader in OpenDDS
+    for debugging purposes.
+  output: |
+    The `DataReaderImpl` class is the core implementation of the DDS DataReader interface in OpenDDS.
+
+    **Location:** dds/DCPS/DataReaderImpl.h
+
+    **Class declaration:**
+    ```cpp
+    // dds/DCPS/DataReaderImpl.h
+    namespace OpenDDS {
+    namespace DCPS {
+
+    class OpenDDS_Dcps_Export DataReaderImpl
+      : public virtual LocalObject<DDS::DataReader>
+      , public virtual DataReaderCallbacks
+      , public virtual EntityImpl
+      , public virtual TransportClient
+      , public virtual TransportReceiveListener
+    {
+    ```
+
+    **Key inheritance:**
+    - `LocalObject<DDS::DataReader>` - Implements DDS::DataReader interface
+    - `DataReaderCallbacks` - Internal callback interface for associations
+    - `EntityImpl` - Base entity functionality (enable, QoS, listener)
+    - `TransportClient` - Transport layer integration
+    - `TransportReceiveListener` - Receives data from transport
+
+    **Key responsibilities:**
+
+    **1. Sample Storage and Management:**
+    ```cpp
+    // Manages received samples per instance
+    typedef OPENDDS_MAP(DDS::InstanceHandle_t, SubscriptionInstance_rch) SubscriptionInstanceMapType;
+    SubscriptionInstanceMapType instances_;
+
+    // Allocator for received data elements
+    ReceivedDataAllocator* rd_allocator_;
+    ```
+
+    **2. Writer Association Tracking:**
+    ```cpp
+    // Tracks DataWriters publishing to this reader
+    typedef OPENDDS_MAP_CMP(GUID_t, WriterInfo_rch, GUID_tKeyLessThan) WriterMapType;
+    WriterMapType writers_;
+    ```
+
+    **3. Statistics Collection:**
+    ```cpp
+    // From WriterStats class in header
+    class WriterStats {
+    public:
+      void add_stat(const TimeDuration& delay);  // Latency tracking
+      LatencyStatistics get_stats() const;
+      void reset_stats();
+    };
+    ```
+
+    **4. Key methods to understand:**
+
+    ```cpp
+    // Called by transport when data arrives
+    void data_received(const ReceivedDataSample& sample);
+
+    // Instance management
+    DDS::InstanceHandle_t lookup_instance(const T& key);
+    void store_instance_data(unique_ptr<DataSampleHeader>, ...);
+
+    // Read/Take operations (type-specific subclass provides typed version)
+    void read_instance_i(...);
+    void take_instance_i(...);
+
+    // QoS and configuration
+    void set_qos(const DDS::DataReaderQos& qos);
+    DDS::DataReaderQos qos_;
+    ```
+
+    **5. Type-specific template subclass:**
+
+    Actual typed readers use `DataReaderImpl_T<MessageType>`:
+    ```cpp
+    // dds/DCPS/DataReaderImpl_T.h
+    template <typename MessageType>
+    class DataReaderImpl_T : public DataReaderImpl {
+      DDS::ReturnCode_t read_i(MessageSeq& data, 
+                               DDS::SampleInfoSeq& info, ...);
+      DDS::ReturnCode_t take_next_sample(MessageType& data, 
+                                         DDS::SampleInfo& info);
+    };
+    ```
+
+    **6. Important internal structures:**
+
+    ```cpp
+    // SubscriptionInstance - one per DDS instance (key value)
+    // Stores sample history for that instance
+    class SubscriptionInstance {
+      ReceivedDataElementList rcvd_samples_;
+      InstanceState instance_state_;
+    };
+
+    // WriterInfo - tracks per-writer state
+    class WriterInfo {
+      GUID_t writer_id_;
+      SequenceNumber last_seq_;
+      bool alive_;
+    };
+    ```
+
+    **Debugging tips:**
+    - Set breakpoint in `data_received()` to see incoming samples
+    - Check `instances_` map for sample storage issues
+    - Examine `writers_` map for association problems
+    - Enable `DCPSDebugLevel=5` to trace internal operations
+
+    **Related files:**
+    - dds/DCPS/DataReaderImpl.cpp - Implementation
+    - dds/DCPS/SubscriptionInstance.h - Instance data
+    - dds/DCPS/WriterInfo.h - Writer tracking
+  metadata:
+    task_type: code_explanation
+    files:
+      - dds/DCPS/DataReaderImpl.h
+    difficulty: hard
+
+- instruction: >
+    Improve the error handling in this DistributedContent example to provide
+    better diagnostics.
+  input: |
+    File: examples/DCPS/DistributedContent/FileInfoListener.cpp
+
+    ```cpp
+    void FileInfoListener::on_data_available (::DDS::DataReader_ptr reader)
+    {
+      try {
+        DistributedContent::FileDiffDataReader_var fileinfo_dr =
+          DistributedContent::FileDiffDataReader::_narrow(reader);
+        if (CORBA::is_nil (fileinfo_dr.in ())) {
+          ACE_ERROR((LM_ERROR, "ERROR: FileInfoListener::on_data_available() _narrow failed.\n"));
+          return;
+        }
+
+        DistributedContent::FileDiff diff;
+        DDS::SampleInfo si ;
+        DDS::ReturnCode_t status = fileinfo_dr->take_next_sample(diff, si) ;
+
+        if (status == DDS::RETCODE_OK) {
+          if (0 != change_monitor_) {
+            change_monitor_->receive_diff(diff);
+          } else {
+            ACE_DEBUG((LM_DEBUG,
+              "FileInfoListener::on_data_available() no change_monitor_ defined\n"));
+          }
+        } else if (status == DDS::RETCODE_NO_DATA) {
+          ACE_ERROR((LM_ERROR,
+            "ERROR: FileInfoListener::on_data_available() received DDS::RETCODE_NO_DATA!"));
+        } else {
+          ACE_ERROR((LM_ERROR,
+            "ERROR: FileInfoListener::on_data_available() read Message: Error: %d\n",
+            status));
+        }
+      } catch (CORBA::Exception&) {
+        ACE_ERROR((LM_ERROR,
+          "ERROR: FileInfoListener::on_data_available() Exception caught in read\n"));
+      }
+    }
+    ```
+
+    The error messages are vague and don't help diagnose issues.
+  output: |
+    Here's an improved version with comprehensive diagnostics:
+
+    ```cpp
+    #include "FileInfoListener.h"
+    #include "AbstractionLayer.h"
+    #include "FileInfoC.h"
+    #include "FileInfoTypeSupportC.h"
+    #include <dds/DCPS/GuidConverter.h>  // For readable GUIDs
+
+    namespace {
+      // Helper to convert return codes to strings
+      const char* retcode_to_string(DDS::ReturnCode_t rc) {
+        switch (rc) {
+          case DDS::RETCODE_OK: return "RETCODE_OK";
+          case DDS::RETCODE_NO_DATA: return "RETCODE_NO_DATA";
+          case DDS::RETCODE_ERROR: return "RETCODE_ERROR";
+          case DDS::RETCODE_BAD_PARAMETER: return "RETCODE_BAD_PARAMETER";
+          case DDS::RETCODE_UNSUPPORTED: return "RETCODE_UNSUPPORTED";
+          case DDS::RETCODE_ALREADY_DELETED: return "RETCODE_ALREADY_DELETED";
+          case DDS::RETCODE_OUT_OF_RESOURCES: return "RETCODE_OUT_OF_RESOURCES";
+          case DDS::RETCODE_NOT_ENABLED: return "RETCODE_NOT_ENABLED";
+          case DDS::RETCODE_PRECONDITION_NOT_MET: return "RETCODE_PRECONDITION_NOT_MET";
+          case DDS::RETCODE_TIMEOUT: return "RETCODE_TIMEOUT";
+          case DDS::RETCODE_ILLEGAL_OPERATION: return "RETCODE_ILLEGAL_OPERATION";
+          default: return "UNKNOWN_RETCODE";
+        }
+      }
+
+      const char* instance_state_to_string(DDS::InstanceStateKind state) {
+        switch (state) {
+          case DDS::ALIVE_INSTANCE_STATE: return "ALIVE";
+          case DDS::NOT_ALIVE_DISPOSED_INSTANCE_STATE: return "DISPOSED";
+          case DDS::NOT_ALIVE_NO_WRITERS_INSTANCE_STATE: return "NO_WRITERS";
+          default: return "UNKNOWN";
+        }
+      }
+    }
+
+    void FileInfoListener::on_data_available(::DDS::DataReader_ptr reader)
+    {
+      ACE_DEBUG((LM_DEBUG, "(%P|%t) FileInfoListener::on_data_available() called\n"));
+      
+      try {
+        DistributedContent::FileDiffDataReader_var fileinfo_dr =
+          DistributedContent::FileDiffDataReader::_narrow(reader);
+        
+        if (CORBA::is_nil(fileinfo_dr.in())) {
+          ACE_ERROR((LM_ERROR,
+            "(%P|%t) ERROR: FileInfoListener::on_data_available() "
+            "_narrow failed - reader may be wrong type or deleted.\n"
+            "  Expected type: DistributedContent::FileDiffDataReader\n"));
+          return;
+        }
+
+        int samples_processed = 0;
+        int invalid_samples = 0;
+        
+        // Loop to process all available samples
+        while (true) {
+          DistributedContent::FileDiff diff;
+          DDS::SampleInfo si;
+          DDS::ReturnCode_t status = fileinfo_dr->take_next_sample(diff, si);
+
+          if (status == DDS::RETCODE_NO_DATA) {
+            ACE_DEBUG((LM_DEBUG,
+              "(%P|%t) FileInfoListener: Processed %d samples (%d invalid)\n",
+              samples_processed, invalid_samples));
+            break;
+          }
+          
+          if (status != DDS::RETCODE_OK) {
+            ACE_ERROR((LM_ERROR,
+              "(%P|%t) ERROR: FileInfoListener::on_data_available() "
+              "take_next_sample failed\n"
+              "  Return code: %C (%d)\n"
+              "  Possible causes:\n"
+              "    - DataReader has been deleted\n"
+              "    - Internal resource exhaustion\n",
+              retcode_to_string(status), status));
+            break;
+          }
+
+          // Log SampleInfo for diagnostics
+          ACE_DEBUG((LM_DEBUG,
+            "(%P|%t) FileInfoListener: Received sample\n"
+            "  valid_data: %C\n"
+            "  instance_state: %C\n"
+            "  sample_rank: %d\n"
+            "  generation_rank: %d\n",
+            si.valid_data ? "true" : "false",
+            instance_state_to_string(si.instance_state),
+            si.sample_rank,
+            si.generation_rank));
+
+          if (!si.valid_data) {
+            ++invalid_samples;
+            // Handle lifecycle events
+            ACE_DEBUG((LM_DEBUG,
+              "(%P|%t) FileInfoListener: Instance state change (no data)\n"
+              "  instance_handle: 0x%x\n"
+              "  instance_state: %C\n",
+              si.instance_handle,
+              instance_state_to_string(si.instance_state)));
+            
+            if (si.instance_state == DDS::NOT_ALIVE_DISPOSED_INSTANCE_STATE) {
+              // Notify application of disposal if needed
+              if (change_monitor_) {
+                // change_monitor_->handle_dispose(si.instance_handle);
+              }
+            }
+            continue;
+          }
+
+          ++samples_processed;
+          
+          // Log received data details
+          ACE_DEBUG((LM_DEBUG,
+            "(%P|%t) FileInfoListener: Valid FileDiff received\n"
+            "  file_id: %d\n"
+            "  filename: %C\n"
+            "  change_source: %C\n"
+            "  version: %d -> %d\n"
+            "  diff_size: %d bytes\n",
+            diff.file_id,
+            diff.filename.in(),
+            diff.change_source.in(),
+            diff.previous_version,
+            diff.new_version,
+            diff.difference.length()));
+
+          if (change_monitor_ != 0) {
+            change_monitor_->receive_diff(diff);
+          } else {
+            ACE_ERROR((LM_WARNING,
+              "(%P|%t) WARNING: FileInfoListener::on_data_available() "
+              "change_monitor_ is null - sample will be discarded.\n"
+              "  Ensure AbstractionLayer is properly initialized.\n"));
+          }
+        }
+        
+      } catch (const CORBA::BAD_PARAM& e) {
+        ACE_ERROR((LM_ERROR,
+          "(%P|%t) ERROR: FileInfoListener CORBA::BAD_PARAM exception\n"
+          "  Info: %C\n"
+          "  This usually indicates type mismatch in _narrow()\n",
+          e._info().c_str()));
+      } catch (const CORBA::Exception& e) {
+        ACE_ERROR((LM_ERROR,
+          "(%P|%t) ERROR: FileInfoListener CORBA::Exception\n"
+          "  Type: %C\n"
+          "  Info: %C\n",
+          e._name(), e._info().c_str()));
+      } catch (const std::exception& e) {
+        ACE_ERROR((LM_ERROR,
+          "(%P|%t) ERROR: FileInfoListener std::exception: %C\n",
+          e.what()));
+      } catch (...) {
+        ACE_ERROR((LM_ERROR,
+          "(%P|%t) ERROR: FileInfoListener unknown exception\n"));
+      }
+    }
+    ```
+
+    **Key improvements:**
+    1. **Process all samples** - Loop until `RETCODE_NO_DATA`
+    2. **Check `valid_data`** - Handle dispose/unregister events
+    3. **Descriptive error messages** - Include return code names and possible causes
+    4. **Sample info logging** - Shows instance state, ranks for debugging
+    5. **Specific exception handling** - Different catch blocks for different exception types
+    6. **Thread/process IDs** - `(%P|%t)` in log messages for multi-process debugging
+    7. **Data content logging** - Shows what was received for verification
+  metadata:
+    task_type: documentation_improvement
+    files:
+      - examples/DCPS/DistributedContent/FileInfoListener.cpp
+      - examples/DCPS/DistributedContent/FileInfo.idl
+    difficulty: medium
+
+- instruction: >
+    How do I define multiple keys in an OpenDDS IDL struct and what effect
+    does it have?
+  input: |
+    I want to track messages by both sender and subject.
+    How do I define a composite key?
+  output: |
+    In OpenDDS, you can define multiple keys by applying the `@key` annotation to multiple fields:
+
+    **IDL Definition:**
+    ```idl
+    module Messaging {
+      @topic
+      struct Message {
+        @key string sender;      // First key field
+        @key string subject;     // Second key field
+        long sequence_number;
+        string body;
+        long long timestamp;
+      };
+    };
+    ```
+
+    **Effect of composite keys:**
+
+    With the above definition, DDS Instances are identified by the combination of `(sender, subject)`:
+
+    | sender  | subject   | Instance   |
+    |---------|-----------|------------|
+    | "Alice" | "Weather" | Instance 1 |
+    | "Alice" | "Sports"  | Instance 2 |
+    | "Bob"   | "Weather" | Instance 3 |
+    | "Bob"   | "Sports"  | Instance 4 |
+
+    **Code usage:**
+    ```cpp
+    // Each unique (sender, subject) combination is a separate instance
+    Messaging::Message msg1;
+    msg1.sender = "Alice";
+    msg1.subject = "Weather";
+    msg1.body = "Sunny today";
+    DDS::InstanceHandle_t h1 = writer->register_instance(msg1);
+
+    Messaging::Message msg2;
+    msg2.sender = "Alice";
+    msg2.subject = "Sports";  // Different subject = different instance
+    msg2.body = "Game tonight";
+    DDS::InstanceHandle_t h2 = writer->register_instance(msg2);
+
+    // h1 != h2 because (Alice, Weather) != (Alice, Sports)
+
+    // Update same instance (Alice, Weather)
+    msg1.body = "Rain expected";
+    msg1.sequence_number = 2;
+    writer->write(msg1, h1);  // Updates Instance 1
+    ```
+
+    **QoS implications:**
+
+    **HISTORY QoS:**
+    ```cpp
+    DDS::DataReaderQos dr_qos;
+    sub->get_default_datareader_qos(dr_qos);
+    dr_qos.history.kind = DDS::KEEP_LAST_HISTORY_QOS;
+    dr_qos.history.depth = 5;  // Keep last 5 samples PER INSTANCE
+    ```
+    With composite key, each `(sender, subject)` pair keeps its own 5-sample history.
+
+    **OWNERSHIP QoS:**
+    Exclusive ownership is determined per-instance. Different writers can own different instances.
+
+    **DEADLINE QoS:**
+    Deadline monitoring is per-instance. Each `(sender, subject)` must receive updates within the deadline.
+
+    **Nested struct keys:**
+    ```idl
+    struct SenderInfo {
+      @key string name;
+      @key string department;
+    };
+
+    @topic
+    struct Message {
+      @key SenderInfo sender;  // Both name and department become keys
+      string subject;
+      string body;
+    };
+    // Instance key is (sender.name, sender.department)
+    ```
+
+    **Comparison with StockQuoter example:**
+    ```idl
+    // From StockQuoter.idl - single key
+    @topic
+    struct Quote {
+      @key string ticker;  // One key: each ticker is an instance
+      string exchange;
+      double value;
+    };
+    // Instances: "SPY", "MDY", "QQQ", etc.
+    ```
+
+    **Best practices:**
+    1. Choose keys that naturally identify your data instances
+    2. Keep keys immutable after instance registration
+    3. Consider key cardinality - too many instances can impact memory
+    4. Use `@key(FALSE)` to explicitly exclude fields in nested structs
+  metadata:
+    task_type: code_explanation
+    files:
+      - examples/DCPS/IntroductionToOpenDDS/StockQuoter.idl
+      - examples/DCPS/Messenger_Imr/Messenger.idl
+    difficulty: easy
+
+- instruction: >
+    Add proper instance lifecycle management (dispose/unregister) to this
+    publisher code.
+  input: |
+    File: examples/DCPS/IntroductionToOpenDDS/publisher.cpp (excerpt)
+
+    ```cpp
+    // Register instances
+    StockQuoter::Quote spy;
+    spy.ticker = CORBA::string_dup("SPY");
+    DDS::InstanceHandle_t spy_handle = quote_dw->register_instance(spy);
+
+    StockQuoter::Quote mdy;
+    mdy.ticker = CORBA::string_dup("MDY");
+    DDS::InstanceHandle_t mdy_handle = quote_dw->register_instance(mdy);
+
+    // Publish quotes...
+    for (int i = 0; i < 20; ++i) {
+      // ... write spy and mdy quotes
+    }
+
+    // Current cleanup - just exits
+    cout << "Exiting..." << endl;
+    ```
+
+    The publisher doesn't properly dispose instances when done, leaving
+    subscribers uncertain about data lifecycle.
+  output: |
+    Here's the improved publisher with proper instance lifecycle management:
+
+    ```cpp
+    // Register instances
+    StockQuoter::Quote spy;
+    spy.ticker = CORBA::string_dup("SPY");
+    DDS::InstanceHandle_t spy_handle = quote_dw->register_instance(spy);
+
+    StockQuoter::Quote mdy;
+    mdy.ticker = CORBA::string_dup("MDY");
+    DDS::InstanceHandle_t mdy_handle = quote_dw->register_instance(mdy);
+
+    // Track registration for cleanup
+    ACE_DEBUG((LM_DEBUG, "Registered instances: SPY (handle=%d), MDY (handle=%d)\n",
+               spy_handle, mdy_handle));
+
+    // Publish quotes...
+    for (int i = 0; i < 20; ++i) {
+      StockQuoter::Quote spy_quote;
+      spy_quote.exchange = STOCK_EXCHANGE_NAME;
+      spy_quote.ticker = CORBA::string_dup("SPY");
+      spy_quote.full_name = CORBA::string_dup("S&P Depository Receipts");
+      spy_quote.value = 1200.0 + 10.0*i;
+      spy_quote.timestamp = get_timestamp();
+
+      DDS::ReturnCode_t ret = quote_dw->write(spy_quote, spy_handle);
+      if (ret != DDS::RETCODE_OK) {
+        ACE_ERROR((LM_ERROR, "ERROR: SPY write returned %d.\n", ret));
+      }
+
+      ACE_OS::sleep(quarterSecond);
+
+      StockQuoter::Quote mdy_quote;
+      mdy_quote.exchange = STOCK_EXCHANGE_NAME;
+      mdy_quote.ticker = CORBA::string_dup("MDY");
+      mdy_quote.full_name = CORBA::string_dup("S&P Midcap Depository Receipts");
+      mdy_quote.value = 1400.0 + 10.0*i;
+      mdy_quote.timestamp = get_timestamp();
+
+      ret = quote_dw->write(mdy_quote, mdy_handle);
+      if (ret != DDS::RETCODE_OK) {
+        ACE_ERROR((LM_ERROR, "ERROR: MDY write returned %d.\n", ret));
+      }
+
+      ACE_OS::sleep(quarterSecond);
+    }
+
+    // ============================================================
+    // PROPER INSTANCE LIFECYCLE MANAGEMENT
+    // ============================================================
+
+    // Option 1: DISPOSE - tells subscribers "this data is no longer valid"
+    // Use when the real-world entity no longer exists or data is stale
+    cout << "Disposing instances..." << endl;
+
+    DDS::ReturnCode_t ret;
+
+    // Dispose SPY - subscribers see instance_state = NOT_ALIVE_DISPOSED
+    ret = quote_dw->dispose(spy, spy_handle);
+    if (ret != DDS::RETCODE_OK) {
+      ACE_ERROR((LM_ERROR, "ERROR: dispose(SPY) returned %d\n", ret));
+    } else {
+      ACE_DEBUG((LM_DEBUG, "Disposed SPY instance\n"));
+    }
+
+    // Dispose MDY
+    ret = quote_dw->dispose(mdy, mdy_handle);
+    if (ret != DDS::RETCODE_OK) {
+      ACE_ERROR((LM_ERROR, "ERROR: dispose(MDY) returned %d\n", ret));
+    } else {
+      ACE_DEBUG((LM_DEBUG, "Disposed MDY instance\n"));
+    }
+
+    // Option 2: UNREGISTER - tells subscribers "I'm done writing this instance"
+    // Use when this writer is done but instance may still be valid from other writers
+    // Subscribers see instance_state = NOT_ALIVE_NO_WRITERS (if no other writers)
+
+    // ret = quote_dw->unregister_instance(spy, spy_handle);
+    // ret = quote_dw->unregister_instance(mdy, mdy_handle);
+
+    // Option 3: Combined - dispose then unregister for complete cleanup
+    // quote_dw->dispose(spy, spy_handle);
+    // quote_dw->unregister_instance(spy, spy_handle);
+
+    // ============================================================
+    // Wait for subscribers to receive disposal notifications
+    // ============================================================
+    cout << "Waiting for subscribers to acknowledge..." << endl;
+
+    // Wait for reliable delivery if using RELIABLE QoS
+    DDS::Duration_t wait_timeout = {10, 0};  // 10 seconds
+    ret = quote_dw->wait_for_acknowledgments(wait_timeout);
+    if (ret == DDS::RETCODE_OK) {
+      ACE_DEBUG((LM_DEBUG, "All samples acknowledged\n"));
+    } else if (ret == DDS::RETCODE_TIMEOUT) {
+      ACE_ERROR((LM_WARNING, "WARNING: Timeout waiting for acknowledgments\n"));
+    }
+
+    // ============================================================
+    // Wait for subscribers to disconnect (optional but courteous)
+    // ============================================================
+    DDS::InstanceHandleSeq handles;
+    int wait_count = 0;
+    while (wait_count < 10) {  // Max 10 seconds
+      quote_dw->get_matched_subscriptions(handles);
+      if (handles.length() == 0) {
+        ACE_DEBUG((LM_DEBUG, "All subscribers disconnected\n"));
+        break;
+      }
+      ACE_DEBUG((LM_DEBUG, "Waiting for %d subscriber(s) to disconnect...\n",
+                 handles.length()));
+      ACE_OS::sleep(1);
+      ++wait_count;
+    }
+
+    cout << "Exiting..." << endl;
+    ```
+
+    **Subscriber-side handling:**
+    ```cpp
+    void QuoteDataReaderListenerImpl::on_data_available(DDS::DataReader_ptr reader)
+    {
+      // ...
+      while (true) {
+        DDS::ReturnCode_t status = quote_dr->take_next_sample(quote, si);
+        
+        if (status == DDS::RETCODE_NO_DATA) break;
+        
+        if (si.valid_data) {
+          // Normal data sample
+          process_quote(quote);
+        } else {
+          // Lifecycle event - no data payload
+          if (si.instance_state == DDS::NOT_ALIVE_DISPOSED_INSTANCE_STATE) {
+            cout << "Quote instance disposed by publisher" << endl;
+            // Clean up local resources for this instance
+          } else if (si.instance_state == DDS::NOT_ALIVE_NO_WRITERS_INSTANCE_STATE) {
+            cout << "Quote instance has no more writers" << endl;
+            // May want to mark data as stale
+          }
+        }
+      }
+    }
+    ```
+
+    **Key concepts:**
+    - **dispose()**: Instance data is no longer valid (entity removed)
+    - **unregister_instance()**: This writer is done (other writers may continue)
+    - **wait_for_acknowledgments()**: Ensure reliable delivery completed
+    - Subscribers receive lifecycle changes via `SampleInfo.instance_state`
+  metadata:
+    task_type: refactoring
+    files:
+      - examples/DCPS/IntroductionToOpenDDS/publisher.cpp
+    difficulty: medium
+
+- instruction: >
+    What are the differences between RTPS discovery and InfoRepo discovery
+    in OpenDDS, and when should I use each?
+  input: |
+    I'm setting up a new OpenDDS deployment and need to choose a discovery mechanism.
+  output: |
+    OpenDDS supports two primary discovery mechanisms with different characteristics:
+
+    ## InfoRepo Discovery (Centralized)
+
+    **Configuration:**
+    ```ini
+    [common]
+    DCPSInfoRepo=corbaloc::localhost:12345/DCPSInfoRepo
+    ```
+
+    **Architecture:**
+    - Centralized server (`DCPSInfoRepo` process) maintains all discovery data
+    - Participants register with InfoRepo
+    - InfoRepo brokers associations between writers and readers
+    - Uses CORBA/IIOP for communication
+
+    **Advantages:**
+    - Works in all network topologies
+    - Single point for monitoring/debugging
+    - Supports persistent durability (with `-file` option)
+    - Works across subnets without multicast
+    - Lower network overhead for static deployments
+
+    **Disadvantages:**
+    - Single point of failure (unless federated)
+    - Requires starting InfoRepo before participants
+    - Extra process to manage
+    - Latency for discovery through central server
+
+    **When to use:**
+    - Enterprise environments with network restrictions
+    - No multicast available
+    - Need centralized control/monitoring
+    - Persistent topic/participant data required
+    - Legacy deployments
+
+    ---
+
+    ## RTPS Discovery (Peer-to-Peer)
+
+    **Configuration:**
+    ```ini
+    [common]
+    DCPSDefaultDiscovery=DEFAULT_RTPS
+
+    # Optional: customize RTPS discovery
+    [rtps_discovery/MyDiscovery]
+    ResendPeriod=5
+    SedpMulticast=1
+    ```
+
+    **Architecture:**
+    - Decentralized, peer-to-peer discovery
+    - Uses RTPS SPDP (Simple Participant Discovery Protocol)
+    - Uses RTPS SEDP (Simple Endpoint Discovery Protocol)
+    - Multicast for participant discovery (configurable)
+    - Unicast for endpoint discovery
+
+    **Advantages:**
+    - No central server required
+    - No single point of failure
+    - OMG DDS-RTPS standard compliant
+    - Interoperable with other DDS implementations
+    - Lower latency for discovery
+    - Self-healing (participants auto-discover on join)
+
+    **Disadvantages:**
+    - Requires multicast (for default config) or peer lists
+    - More network traffic for large systems
+    - Each participant maintains discovery state
+    - More complex debugging
+
+    **When to use:**
+    - Distributed/embedded systems
+    - Need DDS interoperability
+    - Dynamic environments with frequent join/leave
+    - No central infrastructure available
+    - Cloud-native deployments
+
+    ---
+
+    ## Configuration Examples
+
+    **RTPS with explicit peer list (no multicast):**
+    ```ini
+    [common]
+    DCPSDefaultDiscovery=MyDiscovery
+
+    [rtps_discovery/MyDiscovery]
+    SpdpSendAddrs=192.168.1.10:7400,192.168.1.11:7400
+    SedpMulticast=0
+    ```
+
+    **RTPS with custom ports:**
+    ```ini
+    [rtps_discovery/MyDiscovery]
+    PB=7400            # Port base
+    DG=250             # Domain gain (port offset per domain)
+    PG=2               # Participant gain
+    D0=0               # Discovery multicast offset
+    D1=10              # Discovery unicast offset
+    ```
+
+    **InfoRepo with persistence:**
+    ```bash
+    DCPSInfoRepo -o repo.ior -file persistent_data
+    ```
+
+    ---
+
+    ## Hybrid Approach
+
+    You can use different discovery per domain:
+    ```ini
+    [domain/42]
+    DiscoveryConfig=MyRTPS
+
+    [domain/100]
+    DiscoveryConfig=MyInfoRepo
+
+    [rtps_discovery/MyRTPS]
+    # RTPS settings...
+
+    [repository/MyInfoRepo]
+    RepositoryIor=corbaloc::server:12345/DCPSInfoRepo
+    ```
+
+    ---
+
+    ## Decision Matrix
+
+    | Requirement          | InfoRepo         | RTPS             |
+    |----------------------|------------------|------------------|
+    | No multicast         | ✅               | Needs peer list  |
+    | DDS interop          | ❌               | ✅               |
+    | Central control      | ✅               | ❌               |
+    | No extra processes   | ❌               | ✅               |
+    | Fault tolerance      | Needs federation | ✅               |
+    | Dynamic membership   | Slower           | ✅               |
+    | Debugging            | Easier           | Harder           |
+
+    **Recommendation:** Use RTPS for new deployments unless you have specific requirements for centralized control or multicast restrictions.
+  metadata:
+    task_type: build_configuration
+    files:
+      - examples/DCPS/IntroductionToOpenDDS/dds_tcp_conf.ini
+      - docs/devguide/run_time_configuration.rst
+    difficulty: medium

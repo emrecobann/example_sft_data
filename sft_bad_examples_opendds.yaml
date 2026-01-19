@@ -1,0 +1,411 @@
+# BAD SFT Training Examples for OpenDDS
+# These examples demonstrate WHAT NOT TO DO when creating training data
+# Problems can be in: instruction, input, output, or combinations
+
+# =============================================================================
+# CATEGORY 1: Bad Output (instruction/input ok, output wrong)
+# =============================================================================
+
+- instruction: >
+    Explain how the @topic and @key annotations work in OpenDDS IDL files.
+  input: ""
+  output: |
+    @topic and @key are optional decorators. You don't really need them - 
+    OpenDDS will figure out what you want automatically. Just define your 
+    structs normally and it will work fine.
+  why_bad:
+    location: output
+    reasons:
+      - "Completely wrong - @topic is REQUIRED for publishable types"
+      - "@key is essential for instance identity, not optional decoration"
+      - "Vague 'it will work fine' without explanation"
+      - "No code examples"
+  metadata:
+    anti_pattern: incorrect_information
+    bad_location: output
+
+- instruction: >
+    What's the proper cleanup sequence for OpenDDS?
+  input: ""
+  output: |
+    Just call exit(0) at the end of your program. The operating system will 
+    clean up all resources automatically. DDS cleanup is optional.
+  why_bad:
+    location: output
+    reasons:
+      - "Completely wrong - proper cleanup IS required"
+      - "Will cause resource leaks and potential crashes"
+      - "No mention of delete_contained_entities() or shutdown()"
+  metadata:
+    anti_pattern: harmful_advice
+    bad_location: output
+
+- instruction: >
+    Explain the difference between read() and take() in OpenDDS.
+  input: ""
+  output: |
+    They're basically the same thing. Use whichever one you prefer - it's 
+    just a naming convention difference.
+  why_bad:
+    location: output
+    reasons:
+      - "Fundamentally wrong - they have different behaviors"
+      - "read() leaves samples in cache, take() removes them"
+      - "This matters significantly for KEEP_ALL history"
+  metadata:
+    anti_pattern: incorrect_information
+    bad_location: output
+
+# =============================================================================
+# CATEGORY 2: Bad Input (input contains errors, wrong code, bad assumptions)
+# =============================================================================
+
+- instruction: >
+    Fix the bug in this DataReaderListener implementation.
+  input: |
+    ```cpp
+    void MyListener::on_data_available(DDS::DataReader_ptr reader)
+    {
+        MyType::MessageDataReader_var dr = MyType::MessageDataReader::_narrow(reader);
+        MyType::Message msg;
+        DDS::SampleInfo si;
+        dr->take_next_sample(msg, si);
+        cout << msg.content.in() << endl;
+    }
+    ```
+    
+    This code works fine in testing but crashes randomly in production. 
+    I think there might be a threading issue with cout?
+  output: |
+    Yes, the issue is cout is not thread-safe. Add a mutex:
+    
+    ```cpp
+    static std::mutex cout_mutex;
+    void MyListener::on_data_available(DDS::DataReader_ptr reader)
+    {
+        std::lock_guard<std::mutex> lock(cout_mutex);
+        // ... same code ...
+        cout << msg.content.in() << endl;
+    }
+    ```
+  why_bad:
+    location: input_and_output
+    reasons:
+      - "Input assumes wrong root cause (threading with cout)"
+      - "Real bug: missing si.valid_data check causes crash on dispose"
+      - "Real bug: no loop to drain samples"
+      - "Real bug: no error checking on take_next_sample"
+      - "Output 'fixes' the wrong thing, real bugs remain"
+      - "User will still have crashes after applying this 'fix'"
+  metadata:
+    anti_pattern: wrong_diagnosis_in_input
+    bad_location: input_and_output
+
+- instruction: >
+    Why isn't my subscriber receiving data?
+  input: |
+    Publisher code:
+    ```cpp
+    participant = dpf->create_participant(42, PARTICIPANT_QOS_DEFAULT, ...);
+    ts->register_type(participant, "MyMessage");
+    topic = participant->create_topic("TestTopic", "MyMessage", ...);
+    ```
+    
+    Subscriber code:
+    ```cpp
+    participant = dpf->create_participant(42, PARTICIPANT_QOS_DEFAULT, ...);
+    ts->register_type(participant, "Message");  
+    topic = participant->create_topic("TestTopic", "Message", ...);
+    ```
+    
+    Both use the same domain ID and topic name but subscriber never gets data.
+    Is this a network firewall issue?
+  output: |
+    Yes, this is likely a firewall issue. Check that ports 7400-7500 are open 
+    for UDP traffic. You may also need to configure your router for multicast.
+    Try disabling your firewall temporarily to test.
+  why_bad:
+    location: input_and_output
+    reasons:
+      - "Input has obvious bug: type names don't match ('MyMessage' vs 'Message')"
+      - "Input assumes wrong cause (firewall)"
+      - "Output accepts the wrong assumption and gives irrelevant advice"
+      - "Real fix: make type names identical on both sides"
+      - "User will waste time on firewall settings"
+  metadata:
+    anti_pattern: missed_obvious_bug_in_input
+    bad_location: input_and_output
+
+- instruction: >
+    Review my OpenDDS configuration file for issues.
+  input: |
+    ```ini
+    [common]
+    DCPSDebugLevel=0
+    DCPSInfoRepo=corbaloc::localhost:12345/DCPSInfoRepo
+    
+    [transport/tcp]
+    transport_type=tcp
+    local_address=localhost:9000
+    ```
+    
+    My application works on my dev machine but fails to connect when deployed 
+    to the server. The server has IP 192.168.1.50. Is there a timeout setting 
+    I should increase?
+  output: |
+    Yes, add these timeout settings:
+    
+    ```ini
+    [transport/tcp]
+    transport_type=tcp
+    local_address=localhost:9000
+    conn_retry_initial_delay=1000
+    conn_retry_attempts=10
+    passive_reconnect_duration=5000
+    ```
+    
+    This will give more time for the connection to establish.
+  why_bad:
+    location: input_and_output
+    reasons:
+      - "Input has obvious bug: 'localhost' won't work across machines"
+      - "Should use actual IP or 0.0.0.0"
+      - "Input assumes wrong cause (timeout)"
+      - "Output adds timeouts but keeps the real bug (localhost)"
+      - "Will never work on server regardless of timeout values"
+  metadata:
+    anti_pattern: missed_config_error_in_input
+    bad_location: input_and_output
+
+- instruction: >
+    Help me understand why my QoS settings aren't working.
+  input: |
+    I want RELIABLE delivery but data is still being lost:
+    
+    ```cpp
+    DDS::DataWriterQos dw_qos;
+    pub->get_default_datawriter_qos(dw_qos);
+    dw_qos.reliability.kind = DDS::BEST_EFFORT_RELIABILITY_QOS;  // <-- BUG HERE
+    dw_qos.history.kind = DDS::KEEP_ALL_HISTORY_QOS;
+    
+    DDS::DataReaderQos dr_qos;
+    sub->get_default_datareader_qos(dr_qos);
+    dr_qos.reliability.kind = DDS::RELIABLE_RELIABILITY_QOS;
+    ```
+    
+    I've set reliability on both sides but still losing data. Could this be 
+    a network MTU issue?
+  output: |
+    MTU fragmentation can definitely cause data loss. Try reducing your 
+    message size to under 1400 bytes, or configure MTU discovery:
+    
+    ```ini
+    [transport/udp]
+    nak_depth=64
+    ```
+    
+    Also check if jumbo frames are enabled on your network switches.
+  why_bad:
+    location: input_and_output
+    reasons:
+      - "Input has BEST_EFFORT on writer but RELIABLE on reader - incompatible!"
+      - "Comment even marks the bug but question ignores it"
+      - "Input assumes wrong cause (MTU)"
+      - "Output gives irrelevant MTU advice"
+      - "Real fix: change writer to RELIABLE_RELIABILITY_QOS"
+      - "QoS mismatch means association won't even form"
+  metadata:
+    anti_pattern: bug_in_input_ignored
+    bad_location: input_and_output
+
+# =============================================================================
+# CATEGORY 3: Bad Input (misleading context, wrong assumptions)
+# =============================================================================
+
+- instruction: >
+    My OpenDDS application is too slow. How can I optimize it?
+  input: |
+    I'm sending 10 messages per second and the subscriber is 500ms behind.
+    
+    ```cpp
+    for (int i = 0; i < 10; i++) {
+        Message msg;
+        msg.data = generate_data();
+        writer->write(msg, handle);
+        sleep(100);  // 100ms between messages
+    }
+    ```
+    
+    I profiled and OpenDDS write() takes 50ms. Is OpenDDS just slow? 
+    Should I switch to ZeroMQ?
+  output: |
+    Yes, OpenDDS has significant overhead compared to ZeroMQ. For low-latency 
+    applications, ZeroMQ or nanomsg are better choices. You could also try 
+    FastDDS which is more optimized than OpenDDS.
+  why_bad:
+    location: input_and_output
+    reasons:
+      - "Input: sleep(100) is 100 SECONDS not milliseconds in most APIs"
+      - "Input assumes OpenDDS is the bottleneck without evidence"
+      - "Input: '50ms for write()' is suspicious - likely measurement error"
+      - "Output accepts false premise and recommends switching products"
+      - "Real issue is likely the sleep() call or measurement methodology"
+      - "OpenDDS can handle millions of msgs/sec when used correctly"
+  metadata:
+    anti_pattern: false_premise_in_input
+    bad_location: input_and_output
+
+- instruction: >
+    Debug this OpenDDS crash.
+  input: |
+    My application crashes with this stack trace:
+    
+    ```
+    SIGSEGV in MyListener::on_data_available
+      at msg.payload.in() 
+      at line 45
+    ```
+    
+    I already checked and valid_data is true. The crash happens randomly, 
+    about 1 in 1000 messages. Must be a race condition in OpenDDS?
+  output: |
+    This is likely a known race condition in older OpenDDS versions. 
+    Try upgrading to the latest version, or add synchronization:
+    
+    ```cpp
+    static std::mutex listener_mutex;
+    void on_data_available(...) {
+        std::lock_guard<std::mutex> lock(listener_mutex);
+        // ... your code ...
+    }
+    ```
+  why_bad:
+    location: input_and_output
+    reasons:
+      - "Input claims 'valid_data is true' but provides no proof"
+      - "User likely has bug but blames OpenDDS"
+      - "1 in 1000 crash pattern suggests dispose notifications (valid_data=false)"
+      - "Output accepts blame on OpenDDS without verification"
+      - "Mutex won't fix the actual bug (unchecked valid_data)"
+      - "Should ask user to show actual valid_data check code"
+  metadata:
+    anti_pattern: unverified_claim_in_input
+    bad_location: input_and_output
+
+# =============================================================================
+# CATEGORY 4: Bad Instruction (poorly formed questions)
+# =============================================================================
+
+- instruction: >
+    code not work fix it
+  input: |
+    ```cpp
+    void foo() {
+        auto x = thing->do_stuff();
+        process(x);
+    }
+    ```
+  output: |
+    Try adding error handling:
+    
+    ```cpp
+    void foo() {
+        try {
+            auto x = thing->do_stuff();
+            if (x) process(x);
+        } catch (...) {
+            // handle error
+        }
+    }
+    ```
+  why_bad:
+    location: instruction_and_input
+    reasons:
+      - "Instruction is vague - no description of what's wrong"
+      - "Input code is not OpenDDS-related at all"
+      - "No error message, no expected behavior, no actual behavior"
+      - "Output guesses at a fix without understanding the problem"
+      - "This teaches model to accept low-quality questions"
+  metadata:
+    anti_pattern: vague_instruction
+    bad_location: instruction_and_input
+
+- instruction: >
+    Is OpenDDS better than ROS2?
+  input: ""
+  output: |
+    OpenDDS is generally better because it's more mature and has better 
+    documentation. ROS2 is mainly for robots and has a steep learning curve. 
+    For most applications, OpenDDS is the better choice.
+  why_bad:
+    location: instruction_and_output
+    reasons:
+      - "Instruction asks subjective comparison question"
+      - "No context about use case, requirements, constraints"
+      - "Output gives biased opinion as fact"
+      - "ROS2 uses DDS underneath (often FastDDS)"
+      - "Comparison is apples-to-oranges (middleware vs robotics framework)"
+      - "Should ask clarifying questions about requirements"
+  metadata:
+    anti_pattern: subjective_question
+    bad_location: instruction_and_output
+
+# =============================================================================
+# CATEGORY 5: Subtle Bad Examples (look correct but have issues)
+# =============================================================================
+
+- instruction: >
+    Show me how to create a DataWriter with RELIABLE QoS.
+  input: ""
+  output: |
+    ```cpp
+    DDS::DataWriterQos dw_qos;
+    publisher->get_default_datawriter_qos(dw_qos);
+    dw_qos.reliability.kind = DDS::RELIABLE_RELIABILITY_QOS;
+    
+    DDS::DataWriter_var writer = publisher->create_datawriter(
+        topic, dw_qos, nullptr, OpenDDS::DCPS::DEFAULT_STATUS_MASK);
+    
+    // Now write data
+    MyDataWriter_var typed_writer = MyDataWriter::_narrow(writer);
+    typed_writer->write(data, DDS::HANDLE_NIL);
+    ```
+  why_bad:
+    location: output
+    reasons:
+      - "Code looks correct but uses nullptr (C++) mixed with _var (CORBA)"
+      - "Should be DDS::DataWriterListener::_nil() not nullptr"
+      - "Missing check if writer creation succeeded"
+      - "Missing check if _narrow succeeded"
+      - "DDS::HANDLE_NIL should be writer->register_instance() for performance"
+      - "Subtle bugs that only appear in certain compilers/configs"
+  metadata:
+    anti_pattern: subtle_bugs
+    bad_location: output
+
+- instruction: >
+    How do I wait for subscribers before publishing?
+  input: ""
+  output: |
+    Use get_matched_subscriptions:
+    
+    ```cpp
+    DDS::InstanceHandleSeq handles;
+    while (handles.length() == 0) {
+        writer->get_matched_subscriptions(handles);
+        usleep(100000);  // 100ms
+    }
+    // Now publish
+    writer->write(data, handle);
+    ```
+  why_bad:
+    location: output
+    reasons:
+      - "Busy-wait loop wastes CPU"
+      - "usleep is not portable (POSIX only)"
+      - "Should use WaitSet with StatusCondition for PUBLICATION_MATCHED"
+      - "No timeout - infinite loop if no subscriber ever connects"
+      - "Works but teaches inefficient pattern"
+  metadata:
+    anti_pattern: inefficient_but_works
+    bad_location: output
